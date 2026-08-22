@@ -76,7 +76,7 @@ fn setup_enhanced_test(
 #[test]
 fn test_recurring_escrow_lifecycle() {
     let env = Env::default();
-    let (_escrow, _, buyer, artisan, token_id, token_admin, platform_wallet, _) =
+    let (escrow, _, buyer, artisan, token_id, token_admin, platform_wallet, _) =
         setup_enhanced_test(&env);
 
     let total_amount: i128 = 1000;
@@ -115,6 +115,19 @@ fn test_recurring_escrow_lifecycle() {
     assert!(!final_escrow.is_active);
     assert!(!escrow.has_active_escrows(&buyer));
     assert!(!escrow.has_active_escrows(&artisan));
+}
+
+#[test]
+fn test_escrow_rejects_onboarding_state_change_before_authorization() {
+    let env = Env::default();
+    let (escrow, onboarding, buyer, artisan, token_id, token_admin, _, _) =
+        setup_enhanced_test(&env);
+    token_admin.mint(&buyer, &1_000_000);
+
+    onboarding.update_user_role(&buyer, &UserRole::Artisan);
+    assert!(escrow
+        .try_create_escrow(&buyer, &artisan, &token_id, &1_000_000, &99, &None)
+        .is_err());
 }
 
 #[test]

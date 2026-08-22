@@ -154,6 +154,8 @@ pub enum Error {
     RecurringEscrowIdExhausted = 38,
     /// Onboarding contract address has not been configured
     OnboardingContractNotSet = 39,
+    /// The configured onboarding contract rejected the participant state proof
+    OnboardingAuthorizationFailed = 56,
     // â”€â”€ Validation (40+): fix caller input â”€â”€
     /// Provided metadata hash is invalid
     InvalidMetadataHash = 40,
@@ -1490,6 +1492,23 @@ pub struct UserProfile {
     pub status: ProfileStatus,
 }
 
+/// Coherent onboarding state proof passed across the escrow boundary.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct OnboardingAttestation {
+    pub account: Address,
+    pub profile_version: u32,
+    pub role: UserRole,
+    pub is_verified: bool,
+    pub status: ProfileStatus,
+    pub state_revision: u64,
+    pub ledger_sequence: u32,
+    pub operation_id: Bytes,
+    pub contract_instance: Address,
+    pub state_digest: BytesN<32>,
+}
+
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -1512,6 +1531,15 @@ pub struct LegacyUserProfile {
 /// when escrow state changes (release, refund, resolve).
 #[soroban_sdk::contractclient(name = "OnboardingClient")]
 pub trait OnboardingInterface {
+    /// Issue a proof bound to this escrow contract and operation.
+    fn get_onboarding_attestation(
+        env: Env,
+        user: Address,
+        operation_id: Bytes,
+        contract_instance: Address,
+    ) -> OnboardingAttestation;
+    /// Validate and consume a single-use onboarding proof.
+    fn validate_onboarding_attestation(env: Env, attestation: OnboardingAttestation) -> bool;
     /// Increment a user's reputation counters.
     ///
     /// Called by this escrow contract after a terminal escrow outcome where a
@@ -2221,6 +2249,57 @@ impl CraftNexusContract {
             let client = OnboardingClient::new(env, &address);
             (address, client)
         })
+    }
+
+    fn authorize_onboarding_state(
+        env: &Env,
+        user: &Address,
+        operation_id: Bytes,
+        expected_role: UserRole,
+    ) {
+        let escrow_address = env.current_contract_address();
+        let (onboarding_address, onboarding) = match Self::get_onboarding_client(env) {
+            Some(client) => client,
+            None => return,
+        };
+        let attestation = onboarding.get_onboarding_attestation(
+            user,
+            &operation_id,
+            &escrow_address,
+        );
+        if attestation.account != *user
+            || attestation.role != expected_role
+            || attestation.status != ProfileStatus::Active
+        {
+            env.panic_with_error(crate::Error::OnboardingAuthorizationFailed);
+        }
+        match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &onboarding_address,
+            &Symbol::new(env, "validate_onboarding_attestation"),
+            (attestation,).into_val(env),
+        ) {
+            Ok(Ok(true)) => {}
+            _ => env.panic_with_error(crate::Error::OnboardingAuthorizationFailed),
+        }
+    }
+
+    fn onboarding_operation_id(env: &Env, action: &[u8], order_id: u32) -> Bytes {
+        let mut operation_id = Bytes::from_slice(env, action);
+        operation_id.extend_from_slice(&order_id.to_be_bytes());
+        operation_id
+    }
+
+    fn onboarding_operation_id_u64(env: &Env, action: &[u8], identifier: u64) -> Bytes {
+        let mut operation_id = Bytes::from_slice(env, action);
+        operation_id.extend_from_slice(&identifier.to_be_bytes());
+        operation_id
+    }
+
+    fn onboarding_cycle_operation_id(env: &Env, id: u64, cycle: u64) -> Bytes {
+        let mut operation_id = Bytes::from_slice(env, b"release_next_cycle:");
+        operation_id.extend_from_slice(&id.to_be_bytes());
+        operation_id.extend_from_slice(&cycle.to_be_bytes());
+        operation_id
     }
 
     /// Public read-only accessor for the registered onboarding contract
@@ -3485,6 +3564,10 @@ let _previous_admin = config.admin.clone();
         Self::check_not_paused(&env);
         buyer.require_auth();
 
+        let operation_id = Self::onboarding_operation_id(&env, b"create_escrow:", order_id);
+        Self::authorize_onboarding_state(&env, &buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &seller, operation_id, UserRole::Artisan);
+
         // Validate amount is positive and above minimum
         if let Err(e) = Self::check_min_amount(&env, token.clone(), amount) {
             env.panic_with_error(e);
@@ -3641,6 +3724,11 @@ let _previous_admin = config.admin.clone();
     ) -> Escrow {
         let _guard = ReentryGuardScope::new(&env);
 
+        buyer.require_auth();
+        let operation_id = Self::onboarding_operation_id(&env, b"create_unfunded_escrow:", order_id);
+        Self::authorize_onboarding_state(&env, &buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &seller, operation_id, UserRole::Artisan);
+
         // Validate release window bounds
         let config = Self::get_platform_config_internal(&env);
         let min_window = config.min_release_window;
@@ -3754,6 +3842,8 @@ let _previous_admin = config.admin.clone();
         }
 
         escrow.buyer.require_auth();
+        let operation_id = Self::onboarding_operation_id(&env, b"fund_escrow:", order_id);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id, UserRole::Buyer);
 
         // Effects before interaction: a callback can never observe this escrow
         // as unfunded after its balance has been pulled.
@@ -3815,6 +3905,12 @@ let _previous_admin = config.admin.clone();
                 return Err(Error::Unauthorized);
             }
             caller.require_auth();
+        }
+
+        if caller == escrow.buyer || caller == escrow.seller {
+            let expected_role = if caller == escrow.buyer { UserRole::Buyer } else { UserRole::Artisan };
+            let operation_id = Self::onboarding_operation_id(&env, b"cancel_unfunded_escrow:", order_id);
+            Self::authorize_onboarding_state(&env, &caller, operation_id, expected_role);
         }
 
         // Cleanup state
@@ -4776,6 +4872,13 @@ let _previous_admin = config.admin.clone();
 
         // Only buyer can release funds
         escrow_for_auth.buyer.require_auth();
+        let operation_id = Self::onboarding_operation_id(&env, b"release_funds:", order_id);
+        Self::authorize_onboarding_state(
+            &env,
+            &escrow_for_auth.buyer,
+            operation_id,
+            UserRole::Buyer,
+        );
 
         let mut escrow =
             Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::ReleasePending)
@@ -4875,6 +4978,10 @@ let _previous_admin = config.admin.clone();
         if elapsed < escrow_for_window.release_window as u64 {
             env.panic_with_error(crate::Error::ReleaseWindowNotElapsed);
         }
+
+        let operation_id = Self::onboarding_operation_id(&env, b"auto_release:", order_id);
+        Self::authorize_onboarding_state(&env, &escrow_for_window.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow_for_window.seller, operation_id, UserRole::Artisan);
 
         let mut escrow =
             Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::ReleasePending)
@@ -5514,6 +5621,9 @@ let _previous_admin = config.admin.clone();
         let order_id = escrow_id as u32;
         let mut escrow =
             Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::RefundPending)?;
+        let operation_id = Self::onboarding_operation_id(&env, b"refund:", order_id);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
 
         // Deterministic fee allocation via the central FeePolicy engine.
         let allocation = Self::compute_fee_allocation(
@@ -5865,6 +5975,18 @@ let _previous_admin = config.admin.clone();
         {
             env.panic_with_error(crate::Error::Unauthorized);
         }
+        let expected_role = if escrow_for_auth.buyer == authorized_address {
+            UserRole::Buyer
+        } else {
+            UserRole::Artisan
+        };
+        let operation_id = Self::onboarding_operation_id(&env, b"dispute_escrow:", order_id);
+        Self::authorize_onboarding_state(
+            &env,
+            &authorized_address,
+            operation_id,
+            expected_role,
+        );
 
         // Atomically claim the escrow through the DisputePending sentinel to
         // prevent a second concurrent caller from also transitioning it. The
@@ -5994,6 +6116,9 @@ let _previous_admin = config.admin.clone();
 
 
         let mut escrow = Self::get_stored_escrow(&env, order_id);
+        let operation_id = Self::onboarding_operation_id(&env, b"resolve_dispute:", order_id);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
 
         // Guard: must still be in the Disputed state. Resolved, Expired, or
         // Active escrows must not be double-closed.
@@ -6181,7 +6306,6 @@ let _previous_admin = config.admin.clone();
         if !(submitter == escrow.buyer || submitter == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
         }
-
         let dispute_session_id = escrow.dispute_initiated_at.unwrap_or(escrow.created_at as u64);
 
         // Prevent evidence reuse across multiple disputes (#927)
@@ -6202,6 +6326,10 @@ let _previous_admin = config.admin.clone();
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
+        let expected_role = if submitter == escrow.buyer { UserRole::Buyer } else { UserRole::Artisan };
+        let mut operation_id = Self::onboarding_operation_id(&env, b"submit_evidence:", order_id);
+        operation_id.extend_from_slice(&(log.len() as u32).to_be_bytes());
+        Self::authorize_onboarding_state(&env, &submitter, operation_id, expected_role);
 
         let id = log.len() as u64;
         let submitted_at = env.ledger().timestamp();
@@ -6242,7 +6370,6 @@ let _previous_admin = config.admin.clone();
         if !(submitter == escrow.buyer || submitter == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
         }
-
         let dispute_session_id = escrow.dispute_initiated_at.unwrap_or(escrow.created_at as u64);
 
         let key = DataKey::EvidenceLog(order_id);
@@ -6251,6 +6378,10 @@ let _previous_admin = config.admin.clone();
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
+        let expected_role = if submitter == escrow.buyer { UserRole::Buyer } else { UserRole::Artisan };
+        let mut operation_id = Self::onboarding_operation_id(&env, b"submit_counter_evidence:", order_id);
+        operation_id.extend_from_slice(&(log.len() as u32).to_be_bytes());
+        Self::authorize_onboarding_state(&env, &submitter, operation_id, expected_role);
 
         // Validate parent evidence ID exists in current dispute evidence log
         let mut parent_found = false;
@@ -6352,6 +6483,9 @@ let _previous_admin = config.admin.clone();
         if !(caller == escrow.buyer || caller == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
         }
+        let expected_role = if caller == escrow.buyer { UserRole::Buyer } else { UserRole::Artisan };
+        let operation_id = Self::onboarding_operation_id(&env, b"escalate_dispute:", order_id);
+        Self::authorize_onboarding_state(&env, &caller, operation_id, expected_role);
 
         let escalation_key = DataKey::DisputeEscalation(order_id);
         if env.storage().persistent().has(&escalation_key) {
@@ -6434,6 +6568,9 @@ let _previous_admin = config.admin.clone();
         }
 
         let mut escrow = Self::get_stored_escrow(&env, order_id);
+        let operation_id = Self::onboarding_operation_id(&env, b"resolve_dispute_partial:", order_id);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
 
         if escrow.status != EscrowStatus::Disputed {
             env.panic_with_error(crate::Error::InvalidEscrowState);
@@ -6862,6 +6999,9 @@ let _previous_admin = config.admin.clone();
     ) -> Result<u64, Error> {
         // Validate first
         Self::validate_escrow_params(env, &params)?;
+        let operation_id = Self::onboarding_operation_id(env, b"create_batch_escrow:", params.order_id);
+        Self::authorize_onboarding_state(env, &params.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(env, &params.seller, operation_id, UserRole::Artisan);
 
         // Default to 7 days if not specified
         let window = params.release_window.unwrap_or(604800u32);
@@ -7363,6 +7503,23 @@ let _previous_admin = config.admin.clone();
                 if escrow.buyer != authorized_address {
                     return Err(Error::Unauthorized);
                 }
+                let operation_id = Self::onboarding_operation_id(
+                    &env,
+                    b"release_batch_funds:",
+                    order_id,
+                );
+                Self::authorize_onboarding_state(
+                    &env,
+                    &escrow.buyer,
+                    operation_id.clone(),
+                    UserRole::Buyer,
+                );
+                Self::authorize_onboarding_state(
+                    &env,
+                    &escrow.seller,
+                    operation_id,
+                    UserRole::Artisan,
+                );
             }
         }
 
@@ -7574,6 +7731,10 @@ let _previous_admin = config.admin.clone();
         if (initiated_at as u64) + config.max_dispute_duration as u64 > current_time {
             return Err(Error::DisputeExpired);
         }
+
+        let operation_id = Self::onboarding_operation_id(&env, b"resolve_expired_dispute:", order_id);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
 
         // --- Effects (CEI: all writes before the token transfer) ---
 
@@ -8363,6 +8524,13 @@ let _previous_admin = config.admin.clone();
 
         // Require auth from the proposing party
         caller.require_auth();
+        let expected_role = if caller == escrow.buyer {
+            UserRole::Buyer
+        } else {
+            UserRole::Artisan
+        };
+        let operation_id = Self::onboarding_operation_id(&env, b"propose_partial_refund:", order_id);
+        Self::authorize_onboarding_state(&env, &caller, operation_id, expected_role);
 
         // `refund_amount` is interpreted as gross; validation includes any
         // configured refund-side fee to ensure transfers remain solvent.
@@ -8516,6 +8684,9 @@ let _previous_admin = config.admin.clone();
         } else {
             escrow.buyer.require_auth();
         }
+        let operation_id = Self::onboarding_operation_id(&env, b"accept_partial_refund:", order_id);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
 
         let refund_amount_gross = proposal.refund_amount;
         let seller_gross = escrow.amount - refund_amount_gross;
@@ -8615,6 +8786,13 @@ let _previous_admin = config.admin.clone();
 
         // Only the proposer can cancel
         proposal.proposed_by.require_auth();
+        let expected_role = if proposal.proposed_by == escrow.buyer {
+            UserRole::Buyer
+        } else {
+            UserRole::Artisan
+        };
+        let operation_id = Self::onboarding_operation_id(&env, b"cancel_partial_refund:", order_id);
+        Self::authorize_onboarding_state(&env, &proposal.proposed_by, operation_id, expected_role);
 
         // Remove the proposal from storage
         env.storage().persistent().remove(&proposal_key);
@@ -8674,6 +8852,10 @@ let _previous_admin = config.admin.clone();
         if buyer == artisan {
             env.panic_with_error(crate::Error::SameBuyerSeller);
         }
+        let operation_id = Self::onboarding_operation_id_u64(&env, b"create_recurring_escrow:",
+            env.storage().persistent().get(&DataKey::NextRecurringEscrowId).unwrap_or(1u64));
+        Self::authorize_onboarding_state(&env, &buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &artisan, operation_id, UserRole::Artisan);
 
         // Validate token whitelist
         Self::check_token_whitelisted(&env, &token);
@@ -8763,6 +8945,10 @@ let _previous_admin = config.admin.clone();
         if now < escrow.last_release_time + escrow.frequency {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
+
+        let operation_id = Self::onboarding_cycle_operation_id(&env, id, escrow.current_cycle);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow.artisan, operation_id, UserRole::Artisan);
 
         let cycle_amount = if escrow.current_cycle == (escrow.duration as u64) - 1 {
             // Last cycle: handle remainder
@@ -8865,6 +9051,9 @@ let _previous_admin = config.admin.clone();
         if !escrow.is_active {
             env.panic_with_error(crate::Error::InvalidEscrowState);
         }
+        let operation_id = Self::onboarding_operation_id_u64(&env, b"cancel_recurring_escrow:", id);
+        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &escrow.artisan, operation_id, UserRole::Artisan);
 
         let remaining = escrow.total_amount - escrow.released_amount;
 
