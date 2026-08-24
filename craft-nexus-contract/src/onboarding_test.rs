@@ -2885,7 +2885,11 @@ fn test_verification_request_uses_temporary_storage_without_extend_ttl() {
 
     let (client, _) = setup_test(&env);
     let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "temp_vrfy"), &UserRole::Artisan);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "temp_vrfy"),
+        &UserRole::Artisan,
+    );
     client.request_verification(&user);
 
     assert!(client.is_verification_pending(&user));
@@ -2920,7 +2924,11 @@ fn test_legacy_persistent_verification_request_cleared_without_ttl_bump() {
 
     let (client, _) = setup_test(&env);
     let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "legacy_vrfy"), &UserRole::Artisan);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "legacy_vrfy"),
+        &UserRole::Artisan,
+    );
 
     // Simulate a pre-#702 persistent pending marker + queue slot.
     env.as_contract(&client.address, || {
@@ -3065,11 +3073,7 @@ fn test_proof_of_humanity_credential_registration_and_validation() {
     let (client, _admin) = setup_test(&env);
     let user = Address::generate(&env);
 
-    client.onboard_user(
-        &user,
-        &String::from_str(&env, "pohuser"),
-        &UserRole::Buyer,
-    );
+    client.onboard_user(&user, &String::from_str(&env, "pohuser"), &UserRole::Buyer);
 
     let provider = soroban_sdk::Symbol::new(&env, "WorldID");
     let mut cred_buf = [0u8; 32];
@@ -3083,7 +3087,9 @@ fn test_proof_of_humanity_credential_registration_and_validation() {
 
     assert!(client.is_poh_valid(&user));
 
-    let fetched = client.get_poh_credential(&user).expect("PoH credential present");
+    let fetched = client
+        .get_poh_credential(&user)
+        .expect("PoH credential present");
     assert_eq!(fetched.provider_id, provider);
 }
 
@@ -3199,4 +3205,3 @@ fn test_suspicious_profile_flagging_and_review_queue_workflow() {
     assert_eq!(restored_profile.status, ProfileStatus::Active);
     assert!(client.get_suspicious_flag(&user).is_none());
 }
-

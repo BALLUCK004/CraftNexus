@@ -1286,7 +1286,7 @@ fn validate_ipfs_cid(cid: &String) -> bool {
         b'b' => {
             // Stricter length check for typical CIDv1 base32 (sha256/dag-pb is 59 chars)
             // Allow range for different hash types but enforce minimum for valid multihash payload
-            if len < 50 || len > 100 {
+            if !(50..=100).contains(&len) {
                 return false;
             }
             // Logic check: CIDv1 base32 ALWAYS starts with 'ba' because version byte 0x01
@@ -1301,7 +1301,7 @@ fn validate_ipfs_cid(cid: &String) -> bool {
         // base16lower (hex)
         b'f' => {
             // CIDv1 base16 typically ~73 chars for sha256
-            if len < 60 || len > 120 {
+            if !(60..=120).contains(&len) {
                 return false;
             }
             // Logic check: CIDv1 base16 ALWAYS starts with 'f01' (0x01 version byte)
@@ -1315,7 +1315,7 @@ fn validate_ipfs_cid(cid: &String) -> bool {
         // base58btc
         b'z' => {
             // CIDv1 base58 typically ~50 chars
-            if len < 40 || len > 100 {
+            if !(40..=100).contains(&len) {
                 return false;
             }
             payload.iter().all(|b| is_base58_btc_char(*b))
@@ -2243,6 +2243,13 @@ impl OnboardingContract {
         value
     }
 
+    fn increment_persistent_u32(env: &Env, key: &DataKey) {
+        let count: u32 = Self::read_persistent(env, key).unwrap_or(0);
+        let next = count.saturating_add(1);
+        env.storage().persistent().set(key, &next);
+        Self::extend_persistent(env, key);
+    }
+
     fn update_active_user_count(env: &Env, delta: i32) {
         let key = DataKey::ActiveUserCount;
         let count: u32 = Self::read_persistent(env, &key).unwrap_or(0);
@@ -2413,16 +2420,24 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::Config);
 
         // Seed default anti-Sybil configuration (#940)
-        env.storage().persistent().set(&DataKey::OnboardingRateLimitWindow, &3600u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OnboardingRateLimitWindow, &3600u64);
         Self::extend_persistent(&env, &DataKey::OnboardingRateLimitWindow);
 
-        env.storage().persistent().set(&DataKey::MaxOnboardingAttemptsPerWindow, &3u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxOnboardingAttemptsPerWindow, &3u32);
         Self::extend_persistent(&env, &DataKey::MaxOnboardingAttemptsPerWindow);
 
-        env.storage().persistent().set(&DataKey::VerificationCooldown, &86400u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationCooldown, &86400u64);
         Self::extend_persistent(&env, &DataKey::VerificationCooldown);
 
-        env.storage().persistent().set(&DataKey::PohRequiredForAutoVerify, &false);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PohRequiredForAutoVerify, &false);
         Self::extend_persistent(&env, &DataKey::PohRequiredForAutoVerify);
 
         // Issue #939 — seed default reputation decay / anti-farming policy.
@@ -2599,14 +2614,17 @@ impl OnboardingContract {
         // [ANTI-SYBIL] Rate Limiting per address
         let now = env.ledger().timestamp();
         let rate_key = DataKey::RateLimitTracker(user.clone());
-        let mut rate_record: RateLimitRecord = Self::read_persistent(&env, &rate_key).unwrap_or(RateLimitRecord {
-            window_start: now,
-            count: 0,
-            last_attempt: now,
-        });
+        let mut rate_record: RateLimitRecord =
+            Self::read_persistent(&env, &rate_key).unwrap_or(RateLimitRecord {
+                window_start: now,
+                count: 0,
+                last_attempt: now,
+            });
 
-        let window = Self::read_persistent(&env, &DataKey::OnboardingRateLimitWindow).unwrap_or(3600u64);
-        let max_attempts = Self::read_persistent(&env, &DataKey::MaxOnboardingAttemptsPerWindow).unwrap_or(3u32);
+        let window =
+            Self::read_persistent(&env, &DataKey::OnboardingRateLimitWindow).unwrap_or(3600u64);
+        let max_attempts =
+            Self::read_persistent(&env, &DataKey::MaxOnboardingAttemptsPerWindow).unwrap_or(3u32);
 
         if window > 0 {
             if now < rate_record.window_start + window {
@@ -2652,7 +2670,11 @@ impl OnboardingContract {
                             identity_hash: identity_hash.clone(),
                         },
                     );
-                    Self::emit_onboard_failed_and_panic(&env, &user, Error::DuplicateIdentityCorrelation);
+                    Self::emit_onboard_failed_and_panic(
+                        &env,
+                        &user,
+                        Error::DuplicateIdentityCorrelation,
+                    );
                 }
             } else {
                 env.storage().persistent().set(&corr_key, &user);
@@ -3210,8 +3232,8 @@ impl OnboardingContract {
 
         // [SECURITY] Prevent unnecessary state mutations and replay attacks
         // by recording state transition audit trail for forensic analysis
-        let old_role = profile.role.clone();
-        profile.role = new_role.clone();
+        let old_role = profile.role;
+        profile.role = new_role;
 
         // Store updated profile
         Self::persist_public_user_profile(&env, &user, &profile);
@@ -3313,7 +3335,7 @@ impl OnboardingContract {
         // without a follow-up profile read.
         env.events().publish(
             (Symbol::new(&env, "ProfileDeactivated"), user.clone()),
-            (user, profile.role.clone()),
+            (user, profile.role),
         );
     }
 
@@ -3384,7 +3406,7 @@ impl OnboardingContract {
 
         env.events().publish(
             (Symbol::new(&env, "ProfileReactivated"), user.clone()),
-            (user, profile.role.clone()),
+            (user, profile.role),
         );
 
         profile
@@ -3885,11 +3907,15 @@ impl OnboardingContract {
             None => return,
         };
 
-        if profile.is_verified || profile.status == ProfileStatus::UnderReview || profile.status == ProfileStatus::Flagged {
+        if profile.is_verified
+            || profile.status == ProfileStatus::UnderReview
+            || profile.status == ProfileStatus::Flagged
+        {
             return;
         }
 
-        let poh_required = Self::read_persistent(env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
+        let poh_required =
+            Self::read_persistent(env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
         if poh_required && !Self::is_poh_valid(env.clone(), address.clone()) {
             return;
         }
@@ -3898,7 +3924,7 @@ impl OnboardingContract {
             && metrics.total_volume >= config.min_volume_for_verify
         {
             profile.is_verified = true;
-            Self::persist_public_user_profile(env, &address, &profile);
+            Self::persist_public_user_profile(env, address, &profile);
 
             // auto-verification triggered — emit AutoVerifiedEvent (#713)
             env.events().publish(
@@ -3953,11 +3979,15 @@ impl OnboardingContract {
 
         let profile = Self::get_user_profile(&env, address.clone());
 
-        if profile.is_verified || profile.status == ProfileStatus::UnderReview || profile.status == ProfileStatus::Flagged {
+        if profile.is_verified
+            || profile.status == ProfileStatus::UnderReview
+            || profile.status == ProfileStatus::Flagged
+        {
             return false;
         }
 
-        let poh_required = Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
+        let poh_required =
+            Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
         if poh_required && !Self::is_poh_valid(env.clone(), address.clone()) {
             return false;
         }
@@ -4008,7 +4038,8 @@ impl OnboardingContract {
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
         Self::extend_persistent(&env, &DataKey::Config);
 
-        let poh_required = Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
+        let poh_required =
+            Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false);
         if poh_required && !Self::is_poh_valid(env.clone(), user.clone()) {
             env.panic_with_error(Error::InvalidPohCredential);
         }
@@ -4019,7 +4050,8 @@ impl OnboardingContract {
 
         let now = env.ledger().timestamp();
         let last_attempt_key = DataKey::VerificationLastAttempt(user.clone());
-        let cooldown = Self::read_persistent(&env, &DataKey::VerificationCooldown).unwrap_or(86400u64);
+        let cooldown =
+            Self::read_persistent(&env, &DataKey::VerificationCooldown).unwrap_or(86400u64);
         if let Some(last_attempt) = Self::read_persistent::<_, u64>(&env, &last_attempt_key) {
             if cooldown > 0 && now < last_attempt + cooldown {
                 env.panic_with_error(Error::VerificationCooldownActive);
@@ -4626,7 +4658,7 @@ impl OnboardingContract {
         let normalized_new = normalize_username(&env, &new_username);
 
         // Validate new username length
-        let username_len = normalized_new.len() as u32;
+        let username_len = normalized_new.len();
         assert!(
             username_len >= config.min_username_length,
             "Username too short"
@@ -5066,28 +5098,43 @@ impl OnboardingContract {
 
         config.platform_admin.require_auth();
 
-        env.storage().persistent().set(&DataKey::OnboardingRateLimitWindow, &rate_limit_window);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OnboardingRateLimitWindow, &rate_limit_window);
         Self::extend_persistent(&env, &DataKey::OnboardingRateLimitWindow);
 
-        env.storage().persistent().set(&DataKey::MaxOnboardingAttemptsPerWindow, &max_onboard_attempts);
+        env.storage().persistent().set(
+            &DataKey::MaxOnboardingAttemptsPerWindow,
+            &max_onboard_attempts,
+        );
         Self::extend_persistent(&env, &DataKey::MaxOnboardingAttemptsPerWindow);
         Self::extend_persistent(&env, &DataKey::MaxOnboardingAttemptsPerWindow);
 
-        env.storage().persistent().set(&DataKey::VerificationCooldown, &verification_cooldown);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationCooldown, &verification_cooldown);
         Self::extend_persistent(&env, &DataKey::VerificationCooldown);
 
-        env.storage().persistent().set(&DataKey::PohRequiredForAutoVerify, &poh_required_for_auto_verify);
+        env.storage().persistent().set(
+            &DataKey::PohRequiredForAutoVerify,
+            &poh_required_for_auto_verify,
+        );
         Self::extend_persistent(&env, &DataKey::PohRequiredForAutoVerify);
 
         if let Some(ref verifier) = poh_verifier {
-            env.storage().persistent().set(&DataKey::PohVerifier, verifier);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PohVerifier, verifier);
             Self::extend_persistent(&env, &DataKey::PohVerifier);
         } else {
             env.storage().persistent().remove(&DataKey::PohVerifier);
         }
 
         env.events().publish(
-            (Symbol::new(&env, "ConfigUpdated"), Symbol::new(&env, "sybil_config")),
+            (
+                Symbol::new(&env, "ConfigUpdated"),
+                Symbol::new(&env, "sybil_config"),
+            ),
             &config.platform_admin,
         );
     }
@@ -5158,7 +5205,9 @@ impl OnboardingContract {
 
     /// Check if a user holds a valid (unexpired) Proof-of-Humanity credential (#940).
     pub fn is_poh_valid(env: Env, user: Address) -> bool {
-        if let Some(cred) = Self::read_persistent::<_, PohCredential>(&env, &DataKey::UserPohCredential(user)) {
+        if let Some(cred) =
+            Self::read_persistent::<_, PohCredential>(&env, &DataKey::UserPohCredential(user))
+        {
             cred.expires_at > env.ledger().timestamp()
         } else {
             false
