@@ -8483,10 +8483,17 @@ impl CraftNexusContract {
         }
     }
 
-    /// View: check if contract is paused.
+    /// Public read-only query for the platform pause state.
+    ///
+    /// This intentionally reads the same `PlatformConfig::is_paused` field used
+    /// by write guards. An uninitialized contract is active by default, matching
+    /// `check_not_paused`, which also permits read-only access before setup.
     pub fn is_paused(env: Env) -> bool {
-        let config = Self::get_platform_config_internal(&env);
-        config.is_paused
+        env.storage()
+            .instance()
+            .get::<DataKey, PlatformConfig>(&DataKey::PlatformConfig)
+            .map(|config| config.is_paused)
+            .unwrap_or(false)
     }
 
     // â”€â”€ Tiered Artisan Fees (#98) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

@@ -4417,6 +4417,34 @@ fn test_verify_metadata_reveal_authorized_emits_metadata_verified_event() {
 }
 
 #[test]
+fn test_is_paused_public_query_tracks_platform_state() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+
+    // The public query is safe before initialization and starts active.
+    assert!(!client.is_paused());
+
+    env.mock_all_auths();
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    client.initialize(
+        &platform_wallet,
+        &admin,
+        &arbitrator,
+        &500,
+        &None,
+    );
+
+    assert!(!client.is_paused());
+    client.set_paused(&true);
+    assert!(client.is_paused());
+    client.set_paused(&false);
+    assert!(!client.is_paused());
+}
+
+#[test]
 fn test_set_paused_emits_platform_status_events() {
     let env = Env::default();
     env.mock_all_auths();
