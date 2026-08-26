@@ -645,6 +645,10 @@ pub enum DataKey {
     UsedEvidenceHash(BytesN<32>),
     /// Escalation record for a dispute (#941)
     DisputeEscalation(u32),
+    /// Assignment snapshot for a disputed escrow.
+    DisputeAssignment(u32),
+    /// Monotonic revision of the active arbitrator assignment.
+    ArbitratorAssignmentRevision,
     /// Configurable dispute escalation window in seconds (#941)
     DisputeEscalationWindow,
     /// Counter for rate-limited calls per address per window (#943)
@@ -1628,6 +1632,7 @@ pub struct DisputeEvidence {
     pub id: u64,
     pub order_id: u32,
     pub dispute_session_id: u64,
+    pub assignment_revision: u64,
     pub submitter: Address,
     pub evidence_uri: String,
     pub parent_evidence_id: Option<u64>,
@@ -1642,8 +1647,32 @@ pub struct DisputeEvidence {
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub struct DisputeEscalationRecord {
     pub order_id: u32,
+    pub assignment_revision: u64,
     pub escalated_by: Address,
     pub escalated_at: u64,
+}
+
+/// The arbitrator and revision assigned to one active dispute.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct DisputeAssignment {
+    pub order_id: u32,
+    pub arbitrator: Address,
+    pub revision: u64,
+    pub assigned_at: u64,
+}
+
+/// Emitted when an active dispute is explicitly moved to a new assignment.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct DisputeAssignmentChangedEvent {
+    pub order_id: u32,
+    pub old_revision: u64,
+    pub new_revision: u64,
+    pub arbitrator: Address,
+    pub changed_at: u64,
 }
 
 /// Configuration for sensitive action rate limiting (#943).
@@ -1687,6 +1716,7 @@ pub enum SettlementPath {
 pub struct SettlementReceipt {
     pub order_id: u32,
     pub path: SettlementPath,
+    pub assignment_revision: u64,
     pub executed_at: u64,
     pub proposal_nonce: u64,
 }
@@ -3302,6 +3332,10 @@ impl CraftNexusContract {
         env.storage()
             .instance()
             .set(&DataKey::PlatformConfig, &config);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorAssignmentRevision, &1u64);
 
         if let Err(e) = Self::set_fallback_admin(&env, admin.clone()) {
             env.panic_with_error(e);
@@ -5191,6 +5225,41 @@ impl CraftNexusContract {
         Ok(())
     }
 
+    fn current_arbitrator_assignment(env: &Env) -> (Address, u64) {
+        let config = Self::get_platform_config_internal(env);
+        let revision = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorAssignmentRevision)
+            .unwrap_or(1u64);
+        (config.arbitrator, revision)
+    }
+
+    fn get_dispute_assignment_internal(env: &Env, order_id: u32) -> DisputeAssignment {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeAssignment(order_id))
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::InvalidEscrowState))
+    }
+
+    fn assert_active_dispute_assignment(
+        env: &Env,
+        order_id: u32,
+        authorized_address: Option<&Address>,
+    ) -> DisputeAssignment {
+        let assignment = Self::get_dispute_assignment_internal(env, order_id);
+        let (arbitrator, revision) = Self::current_arbitrator_assignment(env);
+        if assignment.revision != revision || assignment.arbitrator != arbitrator {
+            env.panic_with_error(crate::Error::InvalidEscrowState);
+        }
+        if let Some(address) = authorized_address {
+            if *address != assignment.arbitrator {
+                env.panic_with_error(crate::Error::Unauthorized);
+            }
+        }
+        assignment
+    }
+
     fn is_escrow_party(escrow: &Escrow, caller: &Address) -> bool {
         *caller == escrow.buyer || *caller == escrow.seller
     }
@@ -5305,11 +5374,18 @@ impl CraftNexusContract {
         proposal_nonce: u64,
     ) {
         let key = Self::settlement_receipt_key(order_id);
+        let assignment_revision = env
+            .storage()
+            .persistent()
+            .get::<_, DisputeAssignment>(&DataKey::DisputeAssignment(order_id))
+            .map(|assignment| assignment.revision)
+            .unwrap_or(0);
         env.storage().persistent().set(
             &key,
             &SettlementReceipt {
                 order_id,
                 path,
+                assignment_revision,
                 executed_at: env.ledger().timestamp(),
                 proposal_nonce,
             },
@@ -7012,6 +7088,16 @@ impl CraftNexusContract {
                                                       // downstream timers (evidence window, escalation window, max duration).
         escrow.dispute_initiated_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        let (arbitrator, revision) = Self::current_arbitrator_assignment(&env);
+        env.storage().persistent().set(
+            &DataKey::DisputeAssignment(order_id),
+            &DisputeAssignment {
+                order_id,
+                arbitrator,
+                revision,
+                assigned_at: env.ledger().timestamp(),
+            },
+        );
         // Increment the global active dispute counter used by emergency-op
         // guards (admin recovery, upgrade proposals) to detect unsafe conditions.
         Self::update_active_dispute_count(&env, 1);
@@ -7108,6 +7194,7 @@ impl CraftNexusContract {
         let snapshot = Self::get_stored_escrow(&env, order_id);
         Self::assert_open_for_settlement(&env, &snapshot, order_id)
             .unwrap_or_else(|e| env.panic_with_error(e));
+        Self::assert_active_dispute_assignment(&env, order_id, None);
         Self::assert_arbitrator_resolution_window(&env, &snapshot, &config)
             .unwrap_or_else(|e| env.panic_with_error(e));
 
@@ -7244,6 +7331,8 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::NotInDispute);
         }
 
+        let assignment = Self::assert_active_dispute_assignment(&env, order_id, None);
+
         if !(submitter == escrow.buyer || submitter == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
         }
@@ -7279,6 +7368,7 @@ impl CraftNexusContract {
             id,
             order_id,
             dispute_session_id,
+            assignment_revision: assignment.revision,
             submitter,
             evidence_uri,
             parent_evidence_id: None,
@@ -7307,6 +7397,8 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::NotInDispute);
         }
 
+        let assignment = Self::assert_active_dispute_assignment(&env, order_id, None);
+
         if !(submitter == escrow.buyer || submitter == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
         }
@@ -7325,7 +7417,10 @@ impl CraftNexusContract {
         // Validate parent evidence ID exists in current dispute evidence log
         let mut parent_found = false;
         for item in log.iter() {
-            if item.id == parent_evidence_id && item.dispute_session_id == dispute_session_id {
+            if item.id == parent_evidence_id
+                && item.dispute_session_id == dispute_session_id
+                && item.assignment_revision == assignment.revision
+            {
                 parent_found = true;
                 break;
             }
@@ -7354,6 +7449,7 @@ impl CraftNexusContract {
             id,
             order_id,
             dispute_session_id,
+            assignment_revision: assignment.revision,
             submitter,
             evidence_uri,
             parent_evidence_id: Some(parent_evidence_id),
@@ -7402,10 +7498,14 @@ impl CraftNexusContract {
         let all_evidence = Self::get_evidence(env.clone(), order_id);
         let mut valid_log = Vec::new(&env);
         let current_time = env.ledger().timestamp();
+        let assignment = Self::get_dispute_assignment_internal(&env, order_id);
 
         for item in all_evidence.into_iter() {
             // Time policy: evidence is valid while now < expires_at (window active)
-            if !item.is_invalidated && time_policy::is_deadline_pending(current_time, item.expires_at) {
+            if !item.is_invalidated
+                && item.assignment_revision == assignment.revision
+                && time_policy::is_deadline_pending(current_time, item.expires_at)
+            {
                 valid_log.push_back(item);
             }
         }
@@ -7420,6 +7520,8 @@ impl CraftNexusContract {
         if escrow.status != EscrowStatus::Disputed {
             env.panic_with_error(crate::Error::NotInDispute);
         }
+
+        let assignment = Self::assert_active_dispute_assignment(&env, order_id, None);
 
         if !(caller == escrow.buyer || caller == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
@@ -7443,6 +7545,7 @@ impl CraftNexusContract {
 
         let record = DisputeEscalationRecord {
             order_id,
+            assignment_revision: assignment.revision,
             escalated_by: caller,
             escalated_at: current_time,
         };
@@ -7457,6 +7560,46 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .get(&DataKey::DisputeEscalation(order_id))
+    }
+
+    /// Return the assignment snapshot for a disputed order.
+    pub fn get_dispute_assignment(env: Env, order_id: u32) -> Option<DisputeAssignment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeAssignment(order_id))
+    }
+
+    /// Reassign an open dispute to the current arbitrator assignment.
+    pub fn reassign_dispute(env: Env, order_id: u32) {
+        let config = Self::get_platform_config_internal(&env);
+        config.admin.require_auth();
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            env.panic_with_error(crate::Error::NotInDispute);
+        }
+
+        let old_assignment = Self::get_dispute_assignment_internal(&env, order_id);
+        let (arbitrator, revision) = Self::current_arbitrator_assignment(&env);
+        let changed_at = env.ledger().timestamp();
+        let new_assignment = DisputeAssignment {
+            order_id,
+            arbitrator: arbitrator.clone(),
+            revision,
+            assigned_at: changed_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeAssignment(order_id), &new_assignment);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_assignment_changed"), order_id as u64),
+            DisputeAssignmentChangedEvent {
+                order_id,
+                old_revision: old_assignment.revision,
+                new_revision: revision,
+                arbitrator,
+                changed_at,
+            },
+        );
     }
 
     /// Set the dispute escalation window (admin only) (#941).
@@ -7513,6 +7656,7 @@ impl CraftNexusContract {
         let snapshot = Self::get_stored_escrow(&env, order_id);
         Self::assert_open_for_settlement(&env, &snapshot, order_id)
             .unwrap_or_else(|e| env.panic_with_error(e));
+        Self::assert_active_dispute_assignment(&env, order_id, None);
         Self::assert_arbitrator_resolution_window(&env, &snapshot, &config)
             .unwrap_or_else(|e| env.panic_with_error(e));
 
@@ -7594,6 +7738,48 @@ impl CraftNexusContract {
                 timestamp: ts,
             },
         );
+    }
+
+    /// Change the active arbitrator and advance the assignment revision.
+    /// Existing disputes remain financially intact but all actions bound to
+    /// their previous assignment are rejected until an admin explicitly
+    /// reassigns each affected dispute.
+    pub fn update_arbitrator(env: Env, new_arbitrator: Address) {
+        let mut config = Self::get_platform_config_internal(&env);
+        config.admin.require_auth();
+
+        let old_arbitrator = config.arbitrator.clone();
+        let old_revision = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorAssignmentRevision)
+            .unwrap_or(1u64);
+        let new_revision = old_revision
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::InvalidEscrowState));
+
+        config.arbitrator = new_arbitrator.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorAssignmentRevision, &new_revision);
+
+        Self::emit_config_updated(
+            &env,
+            "arbitrator",
+            ConfigValue::Address(old_arbitrator),
+            ConfigValue::Address(new_arbitrator),
+        );
+    }
+
+    /// Return the active arbitrator assignment revision.
+    pub fn get_arbitrator_assignment_revision(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArbitratorAssignmentRevision)
+            .unwrap_or(1u64)
     }
 
     /// Update platform fee percentage (admin only)
