@@ -936,6 +936,10 @@ pub enum Error {
     VerificationCooldownActive = 25,
     /// Volume accumulator overflowed
     VolumeOverflow = 26,
+    /// Escrow count accumulator overflowed (#1028)
+    EscrowCountOverflow = 27,
+    /// Active contracts accumulator overflowed (#1028)
+    ActiveContractOverflow = 28,
 }
 
 /// Cross-contract interface the onboarding contract uses to query the escrow
@@ -3661,7 +3665,8 @@ impl OnboardingContract {
 
         metrics.total_escrow_count = metrics
             .total_escrow_count
-            .saturating_add(escrow_count_delta);
+            .checked_add(escrow_count_delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::EscrowCountOverflow));
 
         // Normalize volume to 7 decimals (base decimal for auto-verification thresholds)
         let token_client = token::Client::new(&env, &token_address);
@@ -3670,7 +3675,9 @@ impl OnboardingContract {
 
         let normalized_delta = if token_decimals < base_decimals {
             let diff = base_decimals - token_decimals;
-            volume_delta.saturating_mul(10i128.pow(diff))
+            volume_delta
+                .checked_mul(10i128.pow(diff))
+                .unwrap_or_else(|| env.panic_with_error(Error::VolumeOverflow))
         } else if token_decimals > base_decimals {
             let diff = token_decimals - base_decimals;
             volume_delta / 10i128.pow(diff)
@@ -3747,7 +3754,9 @@ impl OnboardingContract {
         let current = stored.unwrap_or(0u32);
 
         let next = if delta > 0 {
-            current.saturating_add(delta as u32)
+            current
+                .checked_add(delta as u32)
+                .unwrap_or_else(|| env.panic_with_error(Error::ActiveContractOverflow))
         } else {
             let subtract = (-delta) as u32;
             if subtract > current {

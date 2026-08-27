@@ -35,6 +35,8 @@ mod test;
 mod pagination_boundary_test;
 #[cfg(test)]
 mod prop_test;
+#[cfg(test)]
+mod safe_arithmetic_counters_test;
 
 // Onboarding is a separate logical contract; only one `#[contract]` may be linked per WASM
 // artifact. Keep it in this crate for host tests (`cargo test`) but omit from guest builds.
@@ -258,7 +260,11 @@ pub enum Error {
     /// An escrow with this order ID already exists. Duplicate escrow
     /// identifiers are rejected so a retry (or a conflicting external
     /// reference) can never overwrite an existing escrow's state.
-    EscrowAlreadyExists = 80,
+    EscrowAlreadyExists = 82,
+    /// Counter addition overflowed the maximum representable integer (#1028).
+    CounterOverflow = 83,
+    /// Counter subtraction underflowed below zero (#1028).
+    CounterUnderflow = 84,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -2191,18 +2197,22 @@ impl CraftNexusContract {
     /// Atomically appends one escrow ID to the indexed global registry and
     /// increments `EscrowCount` (#515 / Issue #226).
     fn update_escrow_indices_atomic(env: &Env, order_id: u32) {
-        // Issue #515 â€” O(1) indexed append replaces monolithic AllEscrowIds Vec
+        // Issue #515 — O(1) indexed append replaces monolithic AllEscrowIds Vec
         // rewrites. Legacy Vec entries are migrated lazily on first touch.
         Self::migrate_legacy_all_escrow_ids(env);
 
         let count_key = DataKey::EscrowCount;
         let count = Self::get_persistent_u32(env, &count_key);
 
+        let new_count = count
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
+
         let index_key = DataKey::GlobalEscrowIdIndexed(count);
         env.storage().persistent().set(&index_key, &order_id);
         Self::extend_persistent(env, &index_key);
 
-        env.storage().persistent().set(&count_key, &(count + 1));
+        env.storage().persistent().set(&count_key, &new_count);
         Self::extend_persistent(env, &count_key);
     }
 
@@ -2224,7 +2234,9 @@ impl CraftNexusContract {
                 let index_key = DataKey::GlobalEscrowIdIndexed(count);
                 env.storage().persistent().set(&index_key, &id);
                 Self::extend_persistent(env, &index_key);
-                count += 1;
+                count = count
+                    .checked_add(1)
+                    .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
             }
         }
 
@@ -2317,9 +2329,15 @@ impl CraftNexusContract {
         let key = DataKey::ActiveObligations(user.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         let new_val = if delta > 0 {
-            count.saturating_add(delta as u32)
+            count
+                .checked_add(delta as u32)
+                .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow))
         } else {
-            count.saturating_sub((-delta) as u32)
+            let subtract = (-delta) as u32;
+            if subtract > count {
+                env.panic_with_error(Error::CounterUnderflow);
+            }
+            count - subtract
         };
         env.storage().persistent().set(&key, &new_val);
         Self::extend_persistent(env, &key);
@@ -2330,9 +2348,15 @@ impl CraftNexusContract {
         let key = DataKey::ActiveDisputeCount;
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         let new_val = if delta > 0 {
-            count.saturating_add(delta as u32)
+            count
+                .checked_add(delta as u32)
+                .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow))
         } else {
-            count.saturating_sub((-delta) as u32)
+            let subtract = (-delta) as u32;
+            if subtract > count {
+                env.panic_with_error(Error::CounterUnderflow);
+            }
+            count - subtract
         };
         env.storage().persistent().set(&key, &new_val);
         Self::extend_persistent(env, &key);
@@ -2370,7 +2394,19 @@ impl CraftNexusContract {
     fn update_total_locked(env: &Env, token: &Address, delta: i128) {
         let key = DataKey::TotalLocked(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_total = current.saturating_add(delta);
+        let new_total = if delta >= 0 {
+            current
+                .checked_add(delta)
+                .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow))
+        } else {
+            let sub_amount = delta
+                .checked_neg()
+                .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
+            if sub_amount > current {
+                env.panic_with_error(Error::CounterUnderflow);
+            }
+            current - sub_amount
+        };
         env.storage().persistent().set(&key, &new_total);
         Self::extend_persistent(env, &key);
         env.storage()
@@ -2382,7 +2418,19 @@ impl CraftNexusContract {
     fn update_total_staked(env: &Env, token: &Address, delta: i128) {
         let key = DataKey::TotalStaked(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_total = current.saturating_add(delta);
+        let new_total = if delta >= 0 {
+            current
+                .checked_add(delta)
+                .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow))
+        } else {
+            let sub_amount = delta
+                .checked_neg()
+                .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
+            if sub_amount > current {
+                env.panic_with_error(Error::CounterUnderflow);
+            }
+            current - sub_amount
+        };
         env.storage().persistent().set(&key, &new_total);
         Self::extend_persistent(env, &key);
         env.storage()
@@ -4173,9 +4221,12 @@ impl CraftNexusContract {
             .persistent()
             .set(&buyer_index_key, &(order_id as u64));
         Self::extend_persistent(&env, &buyer_index_key);
+        let new_buyer_count = buyer_count
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
-            .set(&buyer_count_key, &(buyer_count + 1));
+            .set(&buyer_count_key, &new_buyer_count);
         Self::extend_persistent(&env, &buyer_count_key);
 
         // Update seller's escrow list using indexed storage (scalable approach)
@@ -4190,9 +4241,12 @@ impl CraftNexusContract {
             .persistent()
             .set(&seller_index_key, &(order_id as u64));
         Self::extend_persistent(&env, &seller_index_key);
+        let new_seller_count = seller_count
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
-            .set(&seller_count_key, &(seller_count + 1));
+            .set(&seller_count_key, &new_seller_count);
         Self::extend_persistent(&env, &seller_count_key);
 
         Self::safe_update_active_contracts(&env, buyer.clone(), 1);
@@ -4310,9 +4364,12 @@ impl CraftNexusContract {
             .persistent()
             .set(&buyer_index_key, &(order_id as u64));
         Self::extend_persistent(&env, &buyer_index_key);
+        let new_buyer_count = buyer_count
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
-            .set(&buyer_count_key, &(buyer_count + 1));
+            .set(&buyer_count_key, &new_buyer_count);
         Self::extend_persistent(&env, &buyer_count_key);
 
         // Update seller's escrow list
@@ -4327,9 +4384,12 @@ impl CraftNexusContract {
             .persistent()
             .set(&seller_index_key, &(order_id as u64));
         Self::extend_persistent(&env, &seller_index_key);
+        let new_seller_count = seller_count
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
-            .set(&seller_count_key, &(seller_count + 1));
+            .set(&seller_count_key, &new_seller_count);
         Self::extend_persistent(&env, &seller_count_key);
 
         // Track active escrows (unfunded still count towards active limit to prevent spam)
@@ -8174,7 +8234,10 @@ impl CraftNexusContract {
                         env.storage().persistent().set(&buyer_index_key, &id);
                         Self::extend_persistent(&env, &buyer_index_key);
 
-                        buyer_next_counts.set(buyer_key, buyer_count + 1);
+                        let next_buyer = buyer_count
+                            .checked_add(1)
+                            .ok_or(Error::CounterOverflow)?;
+                        buyer_next_counts.set(buyer_key, next_buyer);
 
                         if !seller_next_counts.contains_key(seller_key.clone()) {
                             let existing_count =
@@ -8189,7 +8252,10 @@ impl CraftNexusContract {
                         env.storage().persistent().set(&seller_index_key, &id);
                         Self::extend_persistent(&env, &seller_index_key);
 
-                        seller_next_counts.set(seller_key, seller_count + 1);
+                        let next_seller = seller_count
+                            .checked_add(1)
+                            .ok_or(Error::CounterOverflow)?;
+                        seller_next_counts.set(seller_key, next_seller);
 
                         // Emit batch event
                         let escrow_opt: Option<Escrow> =
@@ -9475,9 +9541,12 @@ impl CraftNexusContract {
             .persistent()
             .get(&DataKey::RecurringEscrowCount)
             .unwrap_or(0);
+        let next_recurring_count = recurring_count
+            .checked_add(1)
+            .ok_or(crate::Error::CounterOverflow)?;
         env.storage().persistent().set(
             &DataKey::RecurringEscrowCount,
-            &recurring_count.saturating_add(1),
+            &next_recurring_count,
         );
         Self::extend_persistent(&env, &DataKey::RecurringEscrowCount);
 
