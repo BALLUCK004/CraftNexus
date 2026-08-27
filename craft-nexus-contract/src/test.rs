@@ -1456,6 +1456,258 @@ fn test_fee_rounding_custom_bps_025_percent() {
     assert_eq!(client.calculate_fee_for_amount(&400), 1); // floor(1.0) => 1
 }
 
+// ===== Fee Calculation Boundary Tests =====
+
+#[test]
+fn test_calculate_fee_zero_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    // Zero amount => zero fee and zero net at the default 5% rate.
+    assert_eq!(client.calculate_fee_for_amount(&0), 0);
+    assert_eq!(client.calculate_seller_net_amount(&0), 0);
+}
+
+#[test]
+fn test_calculate_fee_minimum_amount_rounds_down_to_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    // Minimum non-zero amount: 5% of 1 floors to 0; net keeps the unit.
+    assert_eq!(client.calculate_fee_for_amount(&1), 0);
+    assert_eq!(client.calculate_seller_net_amount(&1), 1);
+}
+
+#[test]
+fn test_calculate_fee_at_maximum_fee_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    // MAX_PLATFORM_FEE_BPS = 1000 (10%) is the deterministic upper bound.
+    client.initialize(&platform_wallet, &admin, &arbitrator, &1000, &None);
+
+    assert_eq!(client.calculate_fee_for_amount(&1000), 100);
+    assert_eq!(client.calculate_fee_for_amount(&10_000), 1_000);
+    assert_eq!(client.calculate_fee_for_amount(&999), 99); // floor(99.9)
+    assert_eq!(client.calculate_seller_net_amount(&1000), 900);
+    assert_eq!(client.calculate_seller_net_amount(&999), 900); // floor(899.1)
+}
+
+#[test]
+fn test_calculate_fee_at_zero_fee_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    // 0 bps is a valid lower-bound configuration: the fee is always zero.
+    client.initialize(&platform_wallet, &admin, &arbitrator, &0, &None);
+
+    assert_eq!(client.calculate_fee_for_amount(&10_000), 0);
+    assert_eq!(client.calculate_seller_net_amount(&10_000), 10_000);
+}
+
+#[test]
+fn test_calculate_fee_near_overflow_max_fee_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    client.initialize(&platform_wallet, &admin, &arbitrator, &1000, &None);
+
+    // Largest amount whose product with 1000 bps still fits in i128.
+    let amount = i128::MAX / 1000;
+    let fee = client.calculate_fee_for_amount(&amount);
+    assert_eq!(fee, (amount * 1000) / 10_000);
+    assert_eq!(client.calculate_seller_net_amount(&amount), amount - fee);
+}
+
+#[test]
+fn test_calculate_fee_overflow_at_max_fee_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    client.initialize(&platform_wallet, &admin, &arbitrator, &1000, &None);
+
+    // One unit past the safe product boundary overflows deterministically.
+    let amount = i128::MAX / 1000 + 1;
+    assert_invalid_fee_error(client.try_calculate_fee_for_amount(&amount));
+    assert_invalid_fee_error(client.try_calculate_seller_net_amount(&amount));
+}
+
+#[test]
+fn test_calculate_fee_negative_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    // Negative amounts are rejected before any arithmetic runs.
+    assert_invalid_fee_error(client.try_calculate_fee_for_amount(&-1));
+    assert_invalid_fee_error(client.try_calculate_seller_net_amount(&-1));
+}
+
+#[test]
+fn test_update_platform_fee_lower_boundary_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    client.update_platform_fee(&0);
+    assert_eq!(client.get_platform_fee(), 0);
+    assert_eq!(client.calculate_fee_for_amount(&10_000), 0);
+}
+
+#[test]
+fn test_update_platform_fee_upper_boundary_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    client.update_platform_fee(&1000); // MAX_PLATFORM_FEE_BPS
+    assert_eq!(client.get_platform_fee(), 1000);
+    assert_eq!(client.calculate_fee_for_amount(&1000), 100);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #10)")]
+fn test_update_platform_fee_one_bps_above_max_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    // 1001 > MAX_PLATFORM_FEE_BPS (1000) => InvalidFee (#10), deterministically.
+    client.update_platform_fee(&1001);
+}
+
+#[test]
+fn test_initialize_accepts_zero_fee_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    client.initialize(&platform_wallet, &admin, &arbitrator, &0, &None);
+    assert_eq!(client.get_platform_fee(), 0);
+}
+
+#[test]
+fn test_initialize_accepts_max_fee_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    client.initialize(&platform_wallet, &admin, &arbitrator, &1000, &None);
+    assert_eq!(client.get_platform_fee(), 1000);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #10)")]
+fn test_initialize_rejects_fee_above_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    let platform_wallet = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    client.initialize(&platform_wallet, &admin, &arbitrator, &1001, &None);
+}
+
+#[test]
+fn test_set_artisan_fee_tier_zero_and_max_boundaries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, _, _, _, _) = setup_test(&env, true);
+
+    client.set_artisan_fee_tier(&seller, &0);
+    assert_eq!(client.get_effective_fee_bps(&seller), 0);
+
+    client.set_artisan_fee_tier(&seller, &1000); // MAX_PLATFORM_FEE_BPS
+    assert_eq!(client.get_effective_fee_bps(&seller), 1000);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #10)")]
+fn test_set_artisan_fee_tier_above_max_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, _, _, _, _) = setup_test(&env, true);
+
+    client.set_artisan_fee_tier(&seller, &1001);
+}
+
+#[test]
+fn test_fee_allocation_invariant_at_boundaries() {
+    let env = Env::default();
+
+    // Boundary amounts: zero, minimum, and the largest safe product at max fee.
+    let amounts = [0i128, 1, 999, 10_000, i128::MAX / 1000];
+    let fee_rates = [0u32, 1, 500, 1000];
+
+    for &amount in amounts.iter() {
+        for &fee_bps in fee_rates.iter() {
+            let kinds = [
+                SettlementKind::ReleaseFunds,
+                SettlementKind::FullRefundNoFee,
+                SettlementKind::ExpiredDisputeDeductFromSeller,
+                SettlementKind::ExpiredDisputeDeductFromBuyer,
+                SettlementKind::ExpiredDisputeSplitFee,
+            ];
+            for &kind in kinds.iter() {
+                let allocation =
+                    CraftNexusContract::compute_fee_allocation(&env, amount, fee_bps, kind);
+                assert_eq!(
+                    allocation.platform_fee + allocation.seller_amount + allocation.buyer_amount,
+                    amount,
+                    "allocation must consume the escrow pot exactly at amount={amount} fee_bps={fee_bps} kind={kind:?}"
+                );
+                assert!(allocation.platform_fee >= 0, "platform_fee must be non-negative");
+                assert!(allocation.seller_amount >= 0, "seller_amount must be non-negative");
+                assert!(allocation.buyer_amount >= 0, "buyer_amount must be non-negative");
+            }
+
+            // PartialRefund must be fed a gross split that sums to the pot.
+            let allocation = CraftNexusContract::compute_fee_allocation(
+                &env,
+                amount,
+                fee_bps,
+                SettlementKind::PartialRefund(0, amount),
+            );
+            assert_eq!(
+                allocation.platform_fee + allocation.seller_amount + allocation.buyer_amount,
+                amount
+            );
+        }
+    }
+}
+
 #[test]
 fn test_integration_multiple_tokens_and_escrows() {
     let env = Env::default();
