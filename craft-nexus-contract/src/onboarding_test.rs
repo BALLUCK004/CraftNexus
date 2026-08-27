@@ -3471,3 +3471,138 @@ fn test_suspicious_profile_flagging_and_review_queue_workflow() {
     assert_eq!(restored_profile.status, ProfileStatus::Active);
     assert!(client.get_suspicious_flag(&user).is_none());
 }
+
+#[test]
+fn test_revision_bound_sybil_review_restricts_then_restores_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "review_bound"),
+        &UserRole::Buyer,
+    );
+    client.set_sybil_reviewer(&reviewer, &true);
+    client.flag_suspicious_profile(&user, &701u32, &600u64);
+
+    let review = client.get_sybil_review(&user).expect("review case");
+    assert_eq!(review.status, SybilReviewStatus::ReviewRequired);
+    assert_eq!(
+        review.profile_revision,
+        client.get_user(&user).state_version
+    );
+    assert!(client
+        .try_update_user_role(&user, &UserRole::Artisan)
+        .is_err());
+
+    client.decide_sybil_review(&reviewer, &user, &review.profile_revision, &true);
+    assert_eq!(client.get_user(&user).status, ProfileStatus::Active);
+    assert_eq!(
+        client.get_sybil_review(&user).unwrap().status,
+        SybilReviewStatus::Approved
+    );
+    assert_eq!(
+        client.update_user_role(&user, &UserRole::Artisan).role,
+        UserRole::Artisan
+    );
+}
+
+#[test]
+fn test_sybil_review_rejects_unauthorized_and_stale_decisions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 2_000);
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "review_stale"),
+        &UserRole::Artisan,
+    );
+    client.flag_suspicious_profile(&user, &702u32, &600u64);
+    let review = client.get_sybil_review(&user).unwrap();
+
+    assert!(client
+        .try_decide_sybil_review(
+            &unauthorized,
+            &user,
+            &review.profile_revision,
+            &true,
+        )
+        .is_err());
+    assert!(client
+        .try_process_review(&user, &true)
+        .is_ok());
+    assert_eq!(client.get_user(&user).status, ProfileStatus::Active);
+
+    client.flag_suspicious_profile(&user, &703u32, &600u64);
+    let current = client.get_sybil_review(&user).unwrap();
+    assert!(client
+        .try_decide_sybil_review(
+            &client.get_config().platform_admin,
+            &user,
+            &(current.profile_revision - 1),
+            &true,
+        )
+        .is_err());
+    assert_eq!(client.get_user(&user).status, ProfileStatus::UnderReview);
+}
+
+#[test]
+fn test_sybil_rejection_appeal_and_expiry_remain_restricted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 3_000);
+    let (client, admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "review_appeal"),
+        &UserRole::Artisan,
+    );
+    client.flag_suspicious_profile(&user, &704u32, &10u64);
+    let opened = client.get_sybil_review(&user).unwrap();
+    client.decide_sybil_review(&admin, &user, &opened.profile_revision, &false);
+    assert_eq!(client.get_user(&user).status, ProfileStatus::Flagged);
+
+    let rejected_revision = client.get_user(&user).state_version;
+    client.appeal_sybil_review(&user, &rejected_revision);
+    let appealed = client.get_sybil_review(&user).unwrap();
+    assert_eq!(appealed.status, SybilReviewStatus::Appealed);
+    assert_eq!(appealed.appeal_count, 1);
+    assert!(client.try_request_verification(&user).is_err());
+
+    env.ledger().with_mut(|li| li.timestamp = appealed.expires_at);
+    client.expire_sybil_review(&user, &appealed.profile_revision);
+    assert_eq!(client.get_user(&user).status, ProfileStatus::Flagged);
+    assert_eq!(
+        client.get_sybil_review(&user).unwrap().status,
+        SybilReviewStatus::Expired
+    );
+}
+
+#[test]
+fn test_normal_verified_profile_is_unaffected_by_review_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "normal_verified"),
+        &UserRole::Buyer,
+    );
+    let verified = client.verify_user(&user);
+
+    assert!(verified.is_verified);
+    assert_eq!(verified.status, ProfileStatus::Active);
+    assert!(client.get_sybil_review(&user).is_none());
+    assert_eq!(
+        client.update_user_role(&user, &UserRole::Artisan).role,
+        UserRole::Artisan
+    );
+}

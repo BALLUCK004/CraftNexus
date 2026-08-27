@@ -256,6 +256,10 @@ pub enum DataKey {
     AttemptRatePolicy,
     /// Suspicious activity flag record per user (#940)
     SuspiciousActivityFlag(Address),
+    /// Revision-bound Sybil review case per profile (#1086)
+    SybilReviewCase(Address),
+    /// Explicitly authorized Sybil reviewer (#1086)
+    SybilReviewer(Address),
     /// Review queue head pointer (#940)
     ReviewQueueHead,
     /// Review queue tail pointer (#940)
@@ -740,6 +744,33 @@ pub struct SuspiciousActivityFlag {
     pub delay_until: u64,
 }
 
+/// Lifecycle of a revision-bound Sybil review case (#1086).
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum SybilReviewStatus {
+    ReviewRequired = 0,
+    Approved = 1,
+    Rejected = 2,
+    Appealed = 3,
+    Expired = 4,
+}
+
+/// Review state is bound to the exact profile revision that was restricted.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SybilReviewCase {
+    pub profile_revision: u32,
+    pub reason_code: u32,
+    pub status: SybilReviewStatus,
+    pub opened_at: u64,
+    pub expires_at: u64,
+    pub decided_at: u64,
+    pub decided_by: Option<Address>,
+    pub appeal_count: u32,
+}
+
 /// Rate limit tracking entry per user address (#940).
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
@@ -817,6 +848,17 @@ pub struct ProfileFlaggedEvent {
 pub struct ReviewCompletedEvent {
     pub user: Address,
     pub action: Symbol,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SybilReviewDecisionEvent {
+    pub user: Address,
+    pub reviewer: Address,
+    pub profile_revision: u32,
+    pub outcome: SybilReviewStatus,
     pub timestamp: u64,
 }
 
@@ -981,6 +1023,14 @@ pub enum Error {
     VolumeOverflow = 26,
     /// Attempt rate policy contains an unusable limit configuration (#1084)
     InvalidRateLimitPolicy = 27,
+    /// Review decision does not match the current profile revision (#1086)
+    ReviewRevisionMismatch = 28,
+    /// Review window expired before a decision was submitted (#1086)
+    ReviewExpired = 29,
+    /// Requested review transition is not valid from the current state (#1086)
+    InvalidReviewTransition = 30,
+    /// Caller is not an authorized Sybil reviewer (#1086)
+    UnauthorizedReviewer = 31,
 }
 
 /// Cross-contract interface the onboarding contract uses to query the escrow
@@ -2315,18 +2365,20 @@ impl OnboardingContract {
 
     /// Assert that `user` is onboarded and their profile is currently active.
     ///
-    /// Panics with [`Error::UserNotFound`] when no profile exists, or with
-    /// [`Error::ProfileDeactivated`] when the profile's status is
-    /// [`ProfileStatus::Deactivated`]. Used by state-mutating endpoints that
-    /// must not operate on deactivated accounts (e.g. `update_user_role`,
+    /// Panics with the status-specific error when the profile is deactivated,
+    /// under review, or flagged. Used by state-mutating endpoints that must not
+    /// operate on restricted accounts (e.g. `update_user_role` and
     /// `deactivate_profile`).
     ///
     /// # Returns
     /// The loaded [`UserProfile`] so callers do not have to fetch it again.
     fn assert_user_onboarded_and_active(env: &Env, user: Address) -> UserProfile {
         let profile = Self::get_user_profile(env, user);
-        if profile.status == ProfileStatus::Deactivated {
-            env.panic_with_error(Error::ProfileDeactivated);
+        match profile.status {
+            ProfileStatus::Deactivated => env.panic_with_error(Error::ProfileDeactivated),
+            ProfileStatus::UnderReview => env.panic_with_error(Error::ProfileUnderReview),
+            ProfileStatus::Flagged => env.panic_with_error(Error::ProfileFlagged),
+            ProfileStatus::Active => {}
         }
         profile
     }
@@ -5436,6 +5488,108 @@ impl OnboardingContract {
         }
     }
 
+    fn require_sybil_reviewer(env: &Env, config: &OnboardingConfig, reviewer: &Address) {
+        reviewer.require_auth();
+        let authorized = *reviewer == config.platform_admin
+            || Self::read_persistent::<_, bool>(env, &DataKey::SybilReviewer(reviewer.clone()))
+                .unwrap_or(false);
+        if !authorized {
+            env.panic_with_error(Error::UnauthorizedReviewer);
+        }
+    }
+
+    fn apply_sybil_review_decision(
+        env: &Env,
+        reviewer: &Address,
+        user: &Address,
+        expected_profile_revision: u32,
+        approve: bool,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(env, &DataKey::Config);
+        Self::require_sybil_reviewer(env, &config, reviewer);
+
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::ReviewRequired
+            && case.status != SybilReviewStatus::Appealed
+        {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+
+        let mut profile = Self::get_user_profile(env, user.clone());
+        if case.profile_revision != expected_profile_revision
+            || profile.state_version != expected_profile_revision
+        {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+        let now = env.ledger().timestamp();
+        if now >= case.expires_at {
+            env.panic_with_error(Error::ReviewExpired);
+        }
+
+        let (outcome, action) = if approve {
+            profile.status = ProfileStatus::Active;
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SuspiciousActivityFlag(user.clone()));
+            (SybilReviewStatus::Approved, "approved")
+        } else {
+            profile.status = ProfileStatus::Flagged;
+            (SybilReviewStatus::Rejected, "rejected")
+        };
+        Self::persist_public_user_profile(env, user, &profile);
+        Self::bump_state_version(env, user);
+
+        case.status = outcome;
+        case.decided_at = now;
+        case.decided_by = Some(reviewer.clone());
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(env, &case_key);
+        Self::advance_review_head(env);
+
+        env.events().publish(
+            (Symbol::new(env, "SybilReviewDecision"),),
+            SybilReviewDecisionEvent {
+                user: user.clone(),
+                reviewer: reviewer.clone(),
+                profile_revision: expected_profile_revision,
+                outcome,
+                timestamp: now,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(env, "ReviewCompleted"),),
+            ReviewCompletedEvent {
+                user: user.clone(),
+                action: Symbol::new(env, action),
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Grant or revoke authority to decide Sybil review cases (#1086).
+    pub fn set_sybil_reviewer(env: Env, reviewer: Address, authorized: bool) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+        let key = DataKey::SybilReviewer(reviewer);
+        if authorized {
+            env.storage().persistent().set(&key, &true);
+            Self::extend_persistent(&env, &key);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+    }
+
     /// Flag a user profile for suspicious anti-Sybil behavior and enqueue for review (admin only) (#940).
     pub fn flag_suspicious_profile(
         env: Env,
@@ -5455,6 +5609,7 @@ impl OnboardingContract {
         let mut profile = Self::get_user_profile(&env, target_user.clone());
         profile.status = ProfileStatus::UnderReview;
         Self::persist_public_user_profile(&env, &target_user, &profile);
+        let profile_revision = Self::bump_state_version(&env, &target_user);
 
         let now = env.ledger().timestamp();
         let flag = SuspiciousActivityFlag {
@@ -5467,6 +5622,20 @@ impl OnboardingContract {
         let flag_key = DataKey::SuspiciousActivityFlag(target_user.clone());
         env.storage().persistent().set(&flag_key, &flag);
         Self::extend_persistent(&env, &flag_key);
+
+        let case_key = DataKey::SybilReviewCase(target_user.clone());
+        let review_case = SybilReviewCase {
+            profile_revision,
+            reason_code,
+            status: SybilReviewStatus::ReviewRequired,
+            opened_at: now,
+            expires_at: now.saturating_add(delay_seconds),
+            decided_at: 0,
+            decided_by: None,
+            appeal_count: 0,
+        };
+        env.storage().persistent().set(&case_key, &review_case);
+        Self::extend_persistent(&env, &case_key);
 
         Self::enqueue_review_request(&env, &target_user);
 
@@ -5491,6 +5660,11 @@ impl OnboardingContract {
     /// Read the active suspicious activity flag for a user (#940).
     pub fn get_suspicious_flag(env: Env, user: Address) -> Option<SuspiciousActivityFlag> {
         Self::read_persistent(&env, &DataKey::SuspiciousActivityFlag(user))
+    }
+
+    /// Read the revision-bound Sybil review case for a profile (#1086).
+    pub fn get_sybil_review(env: Env, user: Address) -> Option<SybilReviewCase> {
+        Self::read_persistent(&env, &DataKey::SybilReviewCase(user))
     }
 
     /// Retrieve queue of addresses currently under administrative anti-Sybil review (admin only) (#940).
@@ -5524,40 +5698,100 @@ impl OnboardingContract {
         queue
     }
 
-    /// Process an anti-Sybil review decision for a user under review (admin only) (#940).
+    /// Submit a reviewer-authorized decision bound to a profile revision (#1086).
+    pub fn decide_sybil_review(
+        env: Env,
+        reviewer: Address,
+        user: Address,
+        expected_profile_revision: u32,
+        approve: bool,
+    ) {
+        Self::apply_sybil_review_decision(
+            &env,
+            &reviewer,
+            &user,
+            expected_profile_revision,
+            approve,
+        );
+    }
+
+    /// Appeal a rejected or expired review and open a new revision-bound window (#1086).
+    pub fn appeal_sybil_review(env: Env, user: Address, expected_profile_revision: u32) {
+        user.require_auth();
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(&env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::Rejected && case.status != SybilReviewStatus::Expired {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        let mut profile = Self::get_user_profile(&env, user.clone());
+        if profile.state_version != expected_profile_revision {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+
+        let duration = case.expires_at.saturating_sub(case.opened_at).max(1);
+        let now = env.ledger().timestamp();
+        profile.status = ProfileStatus::UnderReview;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        let next_revision = Self::bump_state_version(&env, &user);
+        case.profile_revision = next_revision;
+        case.status = SybilReviewStatus::Appealed;
+        case.opened_at = now;
+        case.expires_at = now.saturating_add(duration);
+        case.decided_at = 0;
+        case.decided_by = None;
+        case.appeal_count = case.appeal_count.saturating_add(1);
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(&env, &case_key);
+        Self::enqueue_review_request(&env, &user);
+    }
+
+    /// Close an elapsed review window while keeping the account restricted (#1086).
+    pub fn expire_sybil_review(env: Env, user: Address, expected_profile_revision: u32) {
+        user.require_auth();
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(&env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::ReviewRequired
+            && case.status != SybilReviewStatus::Appealed
+        {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        let mut profile = Self::get_user_profile(&env, user.clone());
+        if case.profile_revision != expected_profile_revision
+            || profile.state_version != expected_profile_revision
+        {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+        if env.ledger().timestamp() < case.expires_at {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        profile.status = ProfileStatus::Flagged;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+        case.status = SybilReviewStatus::Expired;
+        case.decided_at = env.ledger().timestamp();
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(&env, &case_key);
+        Self::advance_review_head(&env);
+    }
+
+    /// Backward-compatible admin decision entrypoint (#940, #1086).
     pub fn process_review(env: Env, user: Address, approve: bool) {
         let config: OnboardingConfig = env
             .storage()
             .persistent()
             .get(&DataKey::Config)
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
-        Self::extend_persistent(&env, &DataKey::Config);
-
-        config.platform_admin.require_auth();
-
-        let mut profile = Self::get_user_profile(&env, user.clone());
-
-        let action_str = if approve {
-            profile.status = ProfileStatus::Active;
-            env.storage()
-                .persistent()
-                .remove(&DataKey::SuspiciousActivityFlag(user.clone()));
-            "approved"
-        } else {
-            profile.status = ProfileStatus::Flagged;
-            "flagged"
-        };
-
-        Self::persist_public_user_profile(&env, &user, &profile);
-
-        let now = env.ledger().timestamp();
-        env.events().publish(
-            (Symbol::new(&env, "ReviewCompleted"),),
-            ReviewCompletedEvent {
-                user,
-                action: Symbol::new(&env, action_str),
-                timestamp: now,
-            },
+        let review: SybilReviewCase =
+            Self::read_persistent(&env, &DataKey::SybilReviewCase(user.clone()))
+                .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        Self::apply_sybil_review_decision(
+            &env,
+            &config.platform_admin,
+            &user,
+            review.profile_revision,
+            approve,
         );
     }
 }
