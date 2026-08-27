@@ -351,6 +351,70 @@
             "key": {
               "vec": [
                 {
+                  "symbol": "GlobalOnboardingRateLimit"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "GlobalOnboardingRateLimit"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "count"
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "last_attempt"
+                      },
+                      "val": {
+                        "u64": 2000
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "window_start"
+                      },
+                      "val": {
+                        "u64": 2000
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
                   "symbol": "MaxOnboardingAttemptsPerWindow"
                 }
               ]
@@ -2201,7 +2265,7 @@
               },
               {
                 "error": {
-                  "contract": 30
+                  "contract": 31
                 }
               }
             ],
@@ -2211,7 +2275,7 @@
                   "string": "failing with contract error"
                 },
                 {
-                  "u32": 30
+                  "u32": 31
                 }
               ]
             }
@@ -2233,7 +2297,7 @@
               },
               {
                 "error": {
-                  "contract": 30
+                  "contract": 31
                 }
               }
             ],
@@ -2258,7 +2322,7 @@
               },
               {
                 "error": {
-                  "contract": 30
+                  "contract": 31
                 }
               }
             ],
@@ -2283,7 +2347,7 @@
               },
               {
                 "error": {
-                  "contract": 30
+                  "contract": 31
                 }
               }
             ],
@@ -3038,7 +3102,7 @@
               },
               {
                 "error": {
-                  "contract": 27
+                  "contract": 28
                 }
               }
             ],
@@ -3048,7 +3112,7 @@
                   "string": "failing with contract error"
                 },
                 {
-                  "u32": 27
+                  "u32": 28
                 }
               ]
             }
@@ -3070,7 +3134,7 @@
               },
               {
                 "error": {
-                  "contract": 27
+                  "contract": 28
                 }
               }
             ],
@@ -3095,7 +3159,7 @@
               },
               {
                 "error": {
-                  "contract": 27
+                  "contract": 28
                 }
               }
             ],
@@ -3120,7 +3184,7 @@
               },
               {
                 "error": {
-                  "contract": 27
+                  "contract": 28
                 }
               }
             ],
