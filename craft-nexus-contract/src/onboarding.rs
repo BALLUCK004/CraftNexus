@@ -246,6 +246,14 @@ pub enum DataKey {
     IdentityCorrelation(Bytes),
     /// Rate limit tracker for onboarding attempts per address (#940)
     RateLimitTracker(Address),
+    /// Per-account verification attempt window (#1084)
+    VerificationRateLimitTracker(Address),
+    /// Global onboarding attempt window (#1084)
+    GlobalOnboardingRateLimit,
+    /// Global verification attempt window (#1084)
+    GlobalVerificationRateLimit,
+    /// Versioned onboarding and verification rate policy (#1084)
+    AttemptRatePolicy,
     /// Suspicious activity flag record per user (#940)
     SuspiciousActivityFlag(Address),
     /// Review queue head pointer (#940)
@@ -742,6 +750,32 @@ pub struct RateLimitRecord {
     pub last_attempt: u64,
 }
 
+/// Versioned per-account and global attempt limits (#1084).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct AttemptRatePolicy {
+    pub revision: u32,
+    pub onboarding_window_secs: u64,
+    pub max_onboarding_per_account: u32,
+    pub max_onboarding_global: u32,
+    pub verification_window_secs: u64,
+    pub max_verification_per_account: u32,
+    pub max_verification_global: u32,
+}
+
+/// Emitted when an onboarding or verification attempt is rate-limited (#1084).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct AttemptRateLimitedEvent {
+    pub user: Address,
+    pub operation: Symbol,
+    pub scope: Symbol,
+    pub policy_revision: u32,
+    pub retry_after: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -945,6 +979,8 @@ pub enum Error {
     VerificationCooldownActive = 25,
     /// Volume accumulator overflowed
     VolumeOverflow = 26,
+    /// Attempt rate policy contains an unusable limit configuration (#1084)
+    InvalidRateLimitPolicy = 27,
 }
 
 /// Cross-contract interface the onboarding contract uses to query the escrow
@@ -1402,6 +1438,113 @@ impl OnboardingContract {
         // Drop any legacy persistent marker left by pre-#702 deployments.
         env.storage().persistent().remove(&pending_key);
         Self::advance_verification_head(env);
+    }
+
+    fn get_attempt_rate_policy_internal(env: &Env) -> AttemptRatePolicy {
+        Self::read_persistent(env, &DataKey::AttemptRatePolicy).unwrap_or_else(|| {
+            AttemptRatePolicy {
+                revision: 1,
+                onboarding_window_secs: Self::read_persistent(
+                    env,
+                    &DataKey::OnboardingRateLimitWindow,
+                )
+                .unwrap_or(3_600),
+                max_onboarding_per_account: Self::read_persistent(
+                    env,
+                    &DataKey::MaxOnboardingAttemptsPerWindow,
+                )
+                .unwrap_or(3),
+                max_onboarding_global: 100,
+                verification_window_secs: 86_400,
+                max_verification_per_account: 3,
+                max_verification_global: 100,
+            }
+        })
+    }
+
+    fn roll_attempt_window(now: u64, window: u64, mut record: RateLimitRecord) -> RateLimitRecord {
+        if window == 0 || now >= record.window_start.saturating_add(window) {
+            record.window_start = now;
+            record.count = 0;
+        }
+        record.last_attempt = now;
+        record
+    }
+
+    /// Check both account and global capacity before writing either tracker.
+    fn consume_attempt_capacity(env: &Env, user: &Address, verification: bool) {
+        let policy = Self::get_attempt_rate_policy_internal(env);
+        let now = env.ledger().timestamp();
+        let (account_key, global_key, window, account_max, global_max, operation) =
+            if verification {
+                (
+                    DataKey::VerificationRateLimitTracker(user.clone()),
+                    DataKey::GlobalVerificationRateLimit,
+                    policy.verification_window_secs,
+                    policy.max_verification_per_account,
+                    policy.max_verification_global,
+                    Symbol::new(env, "verification"),
+                )
+            } else {
+                (
+                    DataKey::RateLimitTracker(user.clone()),
+                    DataKey::GlobalOnboardingRateLimit,
+                    policy.onboarding_window_secs,
+                    policy.max_onboarding_per_account,
+                    policy.max_onboarding_global,
+                    Symbol::new(env, "onboarding"),
+                )
+            };
+
+        let account = Self::roll_attempt_window(
+            now,
+            window,
+            Self::read_persistent(env, &account_key).unwrap_or(RateLimitRecord {
+                window_start: now,
+                count: 0,
+                last_attempt: now,
+            }),
+        );
+        let global = Self::roll_attempt_window(
+            now,
+            window,
+            Self::read_persistent(env, &global_key).unwrap_or(RateLimitRecord {
+                window_start: now,
+                count: 0,
+                last_attempt: now,
+            }),
+        );
+
+        let limited_scope = if account_max > 0 && account.count >= account_max {
+            Some((Symbol::new(env, "account"), account.window_start))
+        } else if global_max > 0 && global.count >= global_max {
+            Some((Symbol::new(env, "global"), global.window_start))
+        } else {
+            None
+        };
+
+        if let Some((scope, window_start)) = limited_scope {
+            env.events().publish(
+                (Symbol::new(env, "AttemptRateLimited"), operation.clone()),
+                AttemptRateLimitedEvent {
+                    user: user.clone(),
+                    operation,
+                    scope,
+                    policy_revision: policy.revision,
+                    retry_after: window_start.saturating_add(window),
+                },
+            );
+            env.panic_with_error(Error::RateLimitExceeded);
+        }
+
+        let mut next_account = account;
+        next_account.count = next_account.count.saturating_add(1);
+        let mut next_global = global;
+        next_global.count = next_global.count.saturating_add(1);
+        env.storage().persistent().set(&account_key, &next_account);
+        Self::extend_persistent(env, &account_key);
+        env.storage().persistent().set(&global_key, &next_global);
+        Self::extend_persistent(env, &global_key);
     }
 
     fn enqueue_review_request(env: &Env, user: &Address) {
@@ -2586,44 +2729,9 @@ impl OnboardingContract {
             }
         }
 
-        // [ANTI-SYBIL] Rate Limiting per address
+        // Check per-account and global capacity before identity/profile writes (#1084).
         let now = env.ledger().timestamp();
-        let rate_key = DataKey::RateLimitTracker(user.clone());
-        let mut rate_record: RateLimitRecord =
-            Self::read_persistent(&env, &rate_key).unwrap_or(RateLimitRecord {
-                window_start: now,
-                count: 0,
-                last_attempt: now,
-            });
-
-        let window =
-            Self::read_persistent(&env, &DataKey::OnboardingRateLimitWindow).unwrap_or(3600u64);
-        let max_attempts =
-            Self::read_persistent(&env, &DataKey::MaxOnboardingAttemptsPerWindow).unwrap_or(3u32);
-
-        if window > 0 {
-            if now < rate_record.window_start + window {
-                if rate_record.count >= max_attempts {
-                    env.events().publish(
-                        (Symbol::new(&env, "SybilPatternDetected"),),
-                        SybilPatternDetectedEvent {
-                            user: user.clone(),
-                            reason: Symbol::new(&env, "RateLimitExceeded"),
-                            timestamp: now,
-                        },
-                    );
-                    Self::emit_onboard_failed_and_panic(&env, &user, Error::RateLimitExceeded);
-                }
-                rate_record.count += 1;
-                rate_record.last_attempt = now;
-            } else {
-                rate_record.window_start = now;
-                rate_record.count = 1;
-                rate_record.last_attempt = now;
-            }
-            env.storage().persistent().set(&rate_key, &rate_record);
-            Self::extend_persistent(&env, &rate_key);
-        }
+        Self::consume_attempt_capacity(&env, &user, false);
 
         // [ANTI-SYBIL] Identity Correlation Check
         if !identity_hash.is_empty() {
@@ -3956,6 +4064,10 @@ impl OnboardingContract {
             return;
         }
 
+        // Capacity is consumed only for a new queue entry, so duplicate pending
+        // requests remain idempotent and never create duplicate records (#1084).
+        Self::consume_attempt_capacity(&env, &user, true);
+
         let now = env.ledger().timestamp();
         let last_attempt_key = DataKey::VerificationLastAttempt(user.clone());
         let cooldown =
@@ -5067,6 +5179,55 @@ impl OnboardingContract {
     /// Read verification cooldown period in seconds (#940).
     pub fn get_verification_cooldown(env: Env) -> u64 {
         Self::read_persistent(&env, &DataKey::VerificationCooldown).unwrap_or(86400)
+    }
+
+    /// Read the active versioned onboarding/verification attempt policy (#1084).
+    pub fn get_attempt_rate_policy(env: Env) -> AttemptRatePolicy {
+        Self::get_attempt_rate_policy_internal(&env)
+    }
+
+    /// Replace attempt limits and advance the policy revision (admin only, #1084).
+    pub fn set_attempt_rate_policy(
+        env: Env,
+        onboarding_window_secs: u64,
+        max_onboarding_per_account: u32,
+        max_onboarding_global: u32,
+        verification_window_secs: u64,
+        max_verification_per_account: u32,
+        max_verification_global: u32,
+    ) -> AttemptRatePolicy {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        if (onboarding_window_secs == 0
+            && (max_onboarding_per_account > 0 || max_onboarding_global > 0))
+            || (verification_window_secs == 0
+                && (max_verification_per_account > 0 || max_verification_global > 0))
+        {
+            env.panic_with_error(Error::InvalidRateLimitPolicy);
+        }
+
+        let revision = Self::get_attempt_rate_policy_internal(&env)
+            .revision
+            .saturating_add(1);
+        let policy = AttemptRatePolicy {
+            revision,
+            onboarding_window_secs,
+            max_onboarding_per_account,
+            max_onboarding_global,
+            verification_window_secs,
+            max_verification_per_account,
+            max_verification_global,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AttemptRatePolicy, &policy);
+        Self::extend_persistent(&env, &DataKey::AttemptRatePolicy);
+        policy
     }
 
     /// Read whether Proof-of-Humanity is required for auto/manual verification (#940).

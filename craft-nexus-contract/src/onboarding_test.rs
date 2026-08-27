@@ -3147,6 +3147,102 @@ fn test_sybil_config_management() {
     assert!(client.get_poh_verifier().is_none());
 }
 
+// ── Issue #1084: Onboarding and verification attempt windows ────────────────
+
+#[test]
+fn test_attempt_rate_policy_revision_advances() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_test(&env);
+
+    assert_eq!(client.get_attempt_rate_policy().revision, 1);
+    let updated = client.set_attempt_rate_policy(
+        &60u64, &2u32, &10u32, &120u64, &3u32, &20u32,
+    );
+    assert_eq!(updated.revision, 2);
+    assert_eq!(client.get_attempt_rate_policy(), updated);
+}
+
+#[test]
+fn test_global_onboarding_limit_resets_after_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _) = setup_test(&env);
+    client.set_attempt_rate_policy(&60u64, &3u32, &1u32, &60u64, &3u32, &10u32);
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    client.onboard_user(
+        &first,
+        &String::from_str(&env, "rate_first"),
+        &UserRole::Buyer,
+    );
+
+    let limited = client.try_onboard_user(
+        &second,
+        &String::from_str(&env, "rate_second"),
+        &UserRole::Artisan,
+    );
+    assert!(limited.is_err());
+    assert!(!client.is_onboarded(&second));
+
+    env.ledger().with_mut(|li| li.timestamp = 1_061);
+    let profile = client.onboard_user(
+        &second,
+        &String::from_str(&env, "rate_second"),
+        &UserRole::Artisan,
+    );
+    assert_eq!(profile.address, second);
+}
+
+#[test]
+fn test_verification_limits_do_not_duplicate_queue_records() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 2_000);
+    let (client, _) = setup_test(&env);
+    client.set_sybil_config(&3_600u64, &10u32, &0u64, &false, &None);
+    client.set_attempt_rate_policy(&60u64, &10u32, &10u32, &60u64, &1u32, &1u32);
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    client.onboard_user(
+        &first,
+        &String::from_str(&env, "verify_one"),
+        &UserRole::Artisan,
+    );
+    client.onboard_user(
+        &second,
+        &String::from_str(&env, "verify_two"),
+        &UserRole::Artisan,
+    );
+
+    client.request_verification(&first);
+    // A repeated pending request is an idempotent no-op and does not add a slot.
+    client.request_verification(&first);
+    assert_eq!(client.get_verification_queue().len(), 1);
+
+    let limited = client.try_request_verification(&second);
+    assert!(limited.is_err());
+    assert!(!client.is_verification_pending(&second));
+    assert_eq!(client.get_verification_queue().len(), 1);
+
+    env.ledger().with_mut(|li| li.timestamp = 2_061);
+    client.request_verification(&second);
+    assert!(client.is_verification_pending(&second));
+    assert_eq!(client.get_verification_queue().len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_attempt_rate_policy_rejects_zero_active_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_test(&env);
+    client.set_attempt_rate_policy(&0u64, &1u32, &1u32, &60u64, &1u32, &1u32);
+}
+
 #[test]
 fn test_proof_of_humanity_credential_registration_and_validation() {
     let env = Env::default();
