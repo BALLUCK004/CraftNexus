@@ -2178,6 +2178,31 @@ impl OnboardingContract {
         Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
     }
 
+    /// Ensure the reverse username index points at the canonical account.
+    /// A missing index is a recoverable partial-onboarding state; an index
+    /// owned by another account is a real uniqueness conflict (#1085).
+    fn ensure_username_claim(env: &Env, normalized: &String, user: &Address) {
+        let key = DataKey::Username(normalized.clone());
+        match Self::read_persistent::<_, Address>(env, &key) {
+            Some(owner) if owner != *user => env.panic_with_error(Error::UsernameTaken),
+            Some(_) => Self::extend_persistent(env, &key),
+            None => {
+                env.storage().persistent().set(&key, user);
+                Self::extend_persistent(env, &key);
+            }
+        }
+    }
+
+    /// Repair secondary state for an existing account-keyed canonical profile.
+    fn repair_onboarding_state(env: &Env, normalized: &String, user: &Address) {
+        Self::ensure_username_claim(env, normalized, user);
+        let version_key = DataKey::UserStateVersion(user.clone());
+        if !env.storage().persistent().has(&version_key) {
+            env.storage().persistent().set(&version_key, &1u32);
+        }
+        Self::extend_persistent(env, &version_key);
+    }
+
     fn migrate_embedded_versioned_profile(
         env: &Env,
         user: &Address,
@@ -2729,7 +2754,37 @@ impl OnboardingContract {
             }
         }
 
-        // Check per-account and global capacity before identity/profile writes (#1084).
+        let normalized = normalize_username(&env, &username);
+        let username_len = core::cmp::min(normalized.len() as usize, 32);
+        let mut user_buf = [0u8; 32];
+        normalized.copy_into_slice(&mut user_buf[..username_len]);
+        let s = core::str::from_utf8(&user_buf[..username_len]).unwrap();
+        let optimized_username = Symbol::new(&env, s);
+
+        if (username_len as u32) < config.min_username_length {
+            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooShort);
+        }
+        if (username_len as u32) > config.max_username_length {
+            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooLong);
+        }
+
+        // The account-keyed profile is canonical. An exact retry returns it and
+        // repairs any missing secondary index without incrementing counters or
+        // repeating identity/rate-limit side effects (#1085).
+        if let Some((existing, _)) = Self::try_get_stored_user_profile(&env, user.clone()) {
+            if existing.username != optimized_username || existing.role != role {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::AlreadyOnboarded);
+            }
+            Self::repair_onboarding_state(&env, &normalized, &user);
+            return Self::stored_to_public(
+                &env,
+                existing,
+                Self::read_portfolio_cid(&env, &user),
+            );
+        }
+
+        // Check per-account and global capacity only after an idempotent retry
+        // has been ruled out, and before identity/profile writes (#1084, #1085).
         let now = env.ledger().timestamp();
         Self::consume_attempt_capacity(&env, &user, false);
 
@@ -2772,32 +2827,15 @@ impl OnboardingContract {
             }
         }
 
-        let normalized = normalize_username(&env, &username);
-        let username_len = core::cmp::min(normalized.len() as usize, 32);
-        let mut user_buf = [0u8; 32];
-        normalized.copy_into_slice(&mut user_buf[..username_len]);
-        let s = core::str::from_utf8(&user_buf[..username_len]).unwrap();
-        let optimized_username = Symbol::new(&env, s);
-
-        if (username_len as u32) < config.min_username_length {
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooShort);
-        }
-        if (username_len as u32) > config.max_username_length {
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooLong);
-        }
-
-        let existing = Self::try_get_stored_user_profile(&env, user.clone());
-        if existing.is_some() {
-            Self::extend_persistent(&env, &DataKey::UserProfile(user.clone()));
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::AlreadyOnboarded);
-        }
-
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Username(normalized.clone()))
-        {
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTaken);
+        if let Some(owner) = Self::read_persistent::<_, Address>(
+            &env,
+            &DataKey::Username(normalized.clone()),
+        ) {
+            // A same-account reservation with no profile is a recoverable
+            // interrupted write; another owner remains a hard conflict.
+            if owner != user {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTaken);
+            }
         }
 
         let profile = UserProfile {
@@ -2817,10 +2855,7 @@ impl OnboardingContract {
         Self::persist_public_user_profile(&env, &user, &profile);
         Self::update_active_user_count(&env, 1);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Username(normalized.clone()), &user);
-        Self::extend_persistent(&env, &DataKey::Username(normalized.clone()));
+        Self::repair_onboarding_state(&env, &normalized, &user);
 
         // Emitted after all storage writes complete, so subscribers observing this
         // event can safely query `get_user` and `get_user_by_username` immediately.
@@ -2835,9 +2870,8 @@ impl OnboardingContract {
         //   - Trigger downstream workflows (welcome emails, dashboard provisioning, etc.)
         //     only after the event is confirmed in a closed ledger to avoid acting on
         //     failed transactions.
-        //   - This event is emitted exactly once per address.  A second call to
-        //     `onboard_user` with the same address panics with `AlreadyOnboarded`
-        //     and produces no event.
+        //   - This event is emitted exactly once per address. An identical retry
+        //     returns the canonical profile without emitting another event.
         env.events().publish(
             (Symbol::new(&env, "UserOnboarded"),),
             UserOnboardedEvent {
@@ -2849,6 +2883,35 @@ impl OnboardingContract {
         Self::increment_persistent_u32(&env, &DataKey::GlobalOnboardCount);
 
         profile
+    }
+
+    /// Repair secondary onboarding state from the account-keyed canonical
+    /// profile without creating or replacing a profile (#1085).
+    pub fn recover_onboarding_profile(env: Env, user: Address, username: String) -> UserProfile {
+        user.require_auth();
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        let normalized = normalize_username(&env, &username);
+        let username_len = core::cmp::min(normalized.len() as usize, 32);
+        let mut user_buf = [0u8; 32];
+        normalized.copy_into_slice(&mut user_buf[..username_len]);
+        let canonical_username = Symbol::new(
+            &env,
+            core::str::from_utf8(&user_buf[..username_len]).unwrap(),
+        );
+        let (stored, _) = Self::try_get_stored_user_profile(&env, user.clone())
+            .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound));
+        if stored.username != canonical_username {
+            env.panic_with_error(Error::AlreadyOnboarded);
+        }
+
+        Self::repair_onboarding_state(&env, &normalized, &user);
+        Self::stored_to_public(&env, stored, Self::read_portfolio_cid(&env, &user))
     }
 
     /// Read-only accessor for a user's profile, keyed by their Stellar

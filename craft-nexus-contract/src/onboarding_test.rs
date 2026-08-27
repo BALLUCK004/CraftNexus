@@ -178,6 +178,94 @@ fn test_onboard_duplicate_user() {
 }
 
 #[test]
+fn test_repeated_identical_onboarding_is_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    let username = String::from_str(&env, "retry_user");
+
+    let before = client.get_active_user_count();
+    let first = client.onboard_user(&user, &username, &UserRole::Artisan);
+    let after_first = client.get_active_user_count();
+    let retried = client.onboard_user(&user, &username, &UserRole::Artisan);
+
+    assert_eq!(retried, first);
+    assert_eq!(after_first, before + 1);
+    assert_eq!(client.get_active_user_count(), after_first);
+    assert_eq!(client.get_user_by_username(&username).address, user);
+}
+
+#[test]
+fn test_idempotent_retry_repairs_missing_secondary_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    let username = String::from_str(&env, "repair_user");
+    let original = client.onboard_user(&user, &username, &UserRole::Buyer);
+    let active_count = client.get_active_user_count();
+    let normalized = normalize_username(&env, &username);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Username(normalized.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UserStateVersion(user.clone()));
+    });
+
+    let recovered = client.onboard_user(&user, &username, &UserRole::Buyer);
+    assert_eq!(recovered.address, original.address);
+    assert_eq!(recovered.registered_at, original.registered_at);
+    assert_eq!(recovered.state_version, 1);
+    assert_eq!(client.get_active_user_count(), active_count);
+    assert_eq!(client.get_user_by_username(&username).address, user);
+}
+
+#[test]
+fn test_explicit_recovery_restores_profile_indexes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    let username = String::from_str(&env, "explicit_repair");
+    client.onboard_user(&user, &username, &UserRole::Artisan);
+    let normalized = normalize_username(&env, &username);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Username(normalized.clone()));
+    });
+
+    let recovered = client.recover_onboarding_profile(&user, &username);
+    assert_eq!(recovered.address, user);
+    assert_eq!(client.get_user_by_username(&username).address, user);
+}
+
+#[test]
+fn test_same_account_username_reservation_is_retryable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    let username = String::from_str(&env, "reserved_retry");
+    let normalized = normalize_username(&env, &username);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Username(normalized), &user);
+    });
+
+    let profile = client.onboard_user(&user, &username, &UserRole::Buyer);
+    assert_eq!(profile.address, user);
+    assert_eq!(client.get_user_by_username(&username).address, user);
+}
+
+#[test]
 fn test_onboard_username_too_short() {
     let env = Env::default();
     env.mock_all_auths();
