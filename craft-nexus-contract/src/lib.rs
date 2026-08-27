@@ -37,6 +37,8 @@ mod pagination_boundary_test;
 mod prop_test;
 #[cfg(test)]
 mod safe_arithmetic_counters_test;
+#[cfg(test)]
+mod idempotency_test;
 
 // Onboarding is a separate logical contract; only one `#[contract]` may be linked per WASM
 // artifact. Keep it in this crate for host tests (`cargo test`) but omit from guest builds.
@@ -265,6 +267,10 @@ pub enum Error {
     CounterOverflow = 83,
     /// Counter subtraction underflowed below zero (#1028).
     CounterUnderflow = 84,
+    /// An idempotency key has already been used for a completed operation (#1025).
+    IdempotencyKeyInUse = 85,
+    /// An idempotency key was supplied with different caller, op type, or parameters (#1025).
+    IdempotencyMismatch = 86,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -657,6 +663,28 @@ pub enum DataKey {
     RateLimitCount(Address, u64),
     /// Platform rate limit configuration (max_calls, window) (#943)
     RateLimitConfig,
+    /// Caller-scoped idempotency record keyed by (caller, operation_key) (#1025)
+    IdempotencyRecord(Address, BytesN<32>),
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+#[repr(u32)]
+pub enum IdempotencyOp {
+    CreateEscrow = 1,
+    ReleaseFunds = 2,
+    Refund = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct IdempotencyRecord {
+    pub op: IdempotencyOp,
+    pub order_id: u32,
+    pub params_hash: BytesN<32>,
+    pub created_at: u64,
 }
 
 #[contracttype]
@@ -2471,6 +2499,71 @@ impl CraftNexusContract {
         }
     }
 
+    /// Extend the TTL of a temporary storage entry using standardized values.
+    #[inline(always)]
+    fn extend_temporary(env: &Env, key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
+        env.storage()
+            .temporary()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_EXTENSION);
+    }
+
+    /// Check and validate an idempotency key if provided (#1025).
+    ///
+    /// If the key has already been used for this caller:
+    /// - If the recorded operation and parameters match, returns `Ok(Some(order_id))`.
+    /// - If the operation or parameters do not match, returns `Err(Error::IdempotencyMismatch)`.
+    /// If the key is fresh or None, returns `Ok(None)`.
+    fn check_idempotency(
+        env: &Env,
+        caller: &Address,
+        idempotency_key: &Option<BytesN<32>>,
+        expected_op: IdempotencyOp,
+        params_hash: &BytesN<32>,
+    ) -> Result<Option<u32>, Error> {
+        let key_bytes = match idempotency_key {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let storage_key = DataKey::IdempotencyRecord(caller.clone(), key_bytes.clone());
+        if let Some(record) = env
+            .storage()
+            .temporary()
+            .get::<_, IdempotencyRecord>(&storage_key)
+        {
+            Self::extend_temporary(env, &storage_key);
+            if record.op == expected_op && &record.params_hash == params_hash {
+                return Ok(Some(record.order_id));
+            } else {
+                return Err(Error::IdempotencyMismatch);
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Record an idempotency key after successful operation execution (#1025).
+    fn record_idempotency(
+        env: &Env,
+        caller: &Address,
+        idempotency_key: &Option<BytesN<32>>,
+        op: IdempotencyOp,
+        order_id: u32,
+        params_hash: BytesN<32>,
+    ) {
+        if let Some(key_bytes) = idempotency_key {
+            let storage_key = DataKey::IdempotencyRecord(caller.clone(), key_bytes.clone());
+            let record = IdempotencyRecord {
+                op,
+                order_id,
+                params_hash,
+                created_at: env.ledger().timestamp(),
+            };
+            env.storage().temporary().set(&storage_key, &record);
+            Self::extend_temporary(env, &storage_key);
+        }
+    }
+
     #[inline(always)]
     fn get_whitelist_count(env: &Env) -> u32 {
         let count_key = DataKey::WhitelistedTokenCount;
@@ -4071,6 +4164,85 @@ impl CraftNexusContract {
         Ok(())
     }
 
+    /// Create a new escrow with an optional idempotency key (#1025).
+    ///
+    /// If an idempotency key is provided and was already used by this caller with the same
+    /// parameters, the existing escrow is returned without duplicate creation.
+    /// If the key was used with different parameters or by a different operation,
+    /// returns `Error::IdempotencyMismatch`.
+    pub fn create_escrow_idempotent(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        amount: i128,
+        order_id: u32,
+        release_window: Option<u32>,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> Result<Escrow, Error> {
+        let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
+        buyer.require_auth();
+
+        let window = release_window.unwrap_or(604800u32);
+        // Compute parameters hash for idempotency checking
+        let mut hasher_bytes = Bytes::new(&env);
+        hasher_bytes.append(&seller.clone().to_xdr(&env));
+        hasher_bytes.append(&token.clone().to_xdr(&env));
+        hasher_bytes.append(&amount.to_xdr(&env));
+        hasher_bytes.append(&order_id.to_xdr(&env));
+        hasher_bytes.append(&window.to_xdr(&env));
+        let params_hash: BytesN<32> = env.crypto().sha256(&hasher_bytes).into();
+
+        if let Some(existing_order_id) = Self::check_idempotency(
+            &env,
+            &buyer,
+            &idempotency_key,
+            IdempotencyOp::CreateEscrow,
+            &params_hash,
+        )? {
+            return Ok(Self::get_stored_escrow(&env, existing_order_id));
+        }
+
+        let escrow = Self::create_escrow_internal(
+            &env,
+            buyer.clone(),
+            seller,
+            token,
+            amount,
+            order_id,
+            release_window,
+            None,
+            None,
+            None,
+        );
+
+        Self::record_idempotency(
+            &env,
+            &buyer,
+            &idempotency_key,
+            IdempotencyOp::CreateEscrow,
+            order_id,
+            params_hash,
+        );
+
+        Ok(escrow)
+    }
+
+    /// Query an idempotency record for a caller and key (#1025).
+    pub fn get_idempotency_record(
+        env: Env,
+        caller: Address,
+        key: BytesN<32>,
+    ) -> Option<IdempotencyRecord> {
+        let storage_key = DataKey::IdempotencyRecord(caller, key);
+        let record = env.storage().temporary().get(&storage_key);
+        if record.is_some() {
+            Self::extend_temporary(&env, &storage_key);
+        }
+        record
+    }
+
     /// Create a new escrow for an order
     ///
     /// # Arguments
@@ -4120,8 +4292,34 @@ impl CraftNexusContract {
         Self::check_not_paused(&env);
         buyer.require_auth();
 
+        Self::create_escrow_internal(
+            &env,
+            buyer,
+            seller,
+            token,
+            amount,
+            order_id,
+            release_window,
+            ipfs_hash,
+            metadata_hash,
+            service_agreement_hash,
+        )
+    }
+
+    fn create_escrow_internal(
+        env: &Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        amount: i128,
+        order_id: u32,
+        release_window: Option<u32>,
+        ipfs_hash: Option<String>,
+        metadata_hash: Option<Bytes>,
+        service_agreement_hash: Option<Bytes>,
+    ) -> Escrow {
         // Validate amount is positive and above minimum
-        if let Err(e) = Self::check_min_amount(&env, token.clone(), amount) {
+        if let Err(e) = Self::check_min_amount(env, token.clone(), amount) {
             env.panic_with_error(e);
         }
 
@@ -4131,10 +4329,10 @@ impl CraftNexusContract {
         }
 
         // Validate token is whitelisted (#103)
-        Self::check_token_whitelisted(&env, &token);
+        Self::check_token_whitelisted(env, &token);
 
         // Check artisan (seller) stake requirement (Issue #99)
-        let config = Self::get_platform_config_internal(&env);
+        let config = Self::get_platform_config_internal(env);
         if config.min_stake_required > 0 {
             Self::migrate_legacy_artisan_stake(env.clone(), seller.clone());
             let artisan_stake: i128 = env
@@ -4153,7 +4351,7 @@ impl CraftNexusContract {
 
         // Validate release window bounds
         let min_window = config.min_release_window;
-        let max_window = Self::get_max_release_window(&env);
+        let max_window = Self::get_max_release_window(env);
 
         if window < min_window {
             env.panic_with_error(crate::Error::ReleaseWindowTooShort);
@@ -4162,7 +4360,7 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::ReleaseWindowTooLong);
         }
 
-        Self::validate_onboarding_state(&env, &buyer, &seller);
+        Self::validate_onboarding_state(env, &buyer, &seller);
 
         let created_at_u64 = env.ledger().timestamp();
         assert!(
@@ -4170,13 +4368,13 @@ impl CraftNexusContract {
             "Ledger timestamp overflow"
         );
         let created_at = created_at_u64 as u32;
-        Self::validate_optional_ipfs_hash(&env, &ipfs_hash);
-        Self::validate_optional_metadata_hash(&env, &metadata_hash);
-        Self::validate_optional_service_agreement_hash(&env, &service_agreement_hash);
+        Self::validate_optional_ipfs_hash(env, &ipfs_hash);
+        Self::validate_optional_metadata_hash(env, &metadata_hash);
+        Self::validate_optional_service_agreement_hash(env, &service_agreement_hash);
 
         // Reject duplicate escrow identifiers (#1027): a retry or a conflicting
         // external reference must never overwrite an existing escrow.
-        Self::assert_escrow_not_exists(&env, order_id);
+        Self::assert_escrow_not_exists(env, order_id);
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -4199,15 +4397,15 @@ impl CraftNexusContract {
         };
 
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
-        Self::extend_persistent(&env, &(ESCROW, order_id));
+        Self::extend_persistent(env, &(ESCROW, order_id));
 
         // Track active escrows
-        Self::update_active_obligations(&env, &buyer, 1);
-        Self::update_active_obligations(&env, &seller, 1);
+        Self::update_active_obligations(env, &buyer, 1);
+        Self::update_active_obligations(env, &seller, 1);
 
         // Update global escrow index for off-chain enumeration using atomic function
         // This ensures AllEscrowIds and EscrowCount always remain in sync (Issue #226)
-        Self::update_escrow_indices_atomic(&env, order_id);
+        Self::update_escrow_indices_atomic(env, order_id);
 
         // Update buyer's escrow list using indexed storage (scalable approach)
         let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
@@ -4220,14 +4418,14 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .set(&buyer_index_key, &(order_id as u64));
-        Self::extend_persistent(&env, &buyer_index_key);
+        Self::extend_persistent(env, &buyer_index_key);
         let new_buyer_count = buyer_count
             .checked_add(1)
             .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
             .set(&buyer_count_key, &new_buyer_count);
-        Self::extend_persistent(&env, &buyer_count_key);
+        Self::extend_persistent(env, &buyer_count_key);
 
         // Update seller's escrow list using indexed storage (scalable approach)
         let seller_count_key = DataKey::SellerEscrowCount(seller.clone());
@@ -4240,33 +4438,33 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .set(&seller_index_key, &(order_id as u64));
-        Self::extend_persistent(&env, &seller_index_key);
+        Self::extend_persistent(env, &seller_index_key);
         let new_seller_count = seller_count
             .checked_add(1)
             .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
             .set(&seller_count_key, &new_seller_count);
-        Self::extend_persistent(&env, &seller_count_key);
+        Self::extend_persistent(env, &seller_count_key);
 
-        Self::safe_update_active_contracts(&env, buyer.clone(), 1);
-        Self::safe_update_active_contracts(&env, seller.clone(), 1);
+        Self::safe_update_active_contracts(env, buyer.clone(), 1);
+        Self::safe_update_active_contracts(env, seller.clone(), 1);
 
         // Commit locked accounting before the external token interaction.
-        Self::update_total_locked(&env, &token, amount);
+        Self::update_total_locked(env, &token, amount);
         Self::transfer_tokens_and_record_audit(
-            &env,
+            env,
             &token,
             &buyer,
             &env.current_contract_address(),
             amount,
             &buyer,
-            Symbol::new(&env, "escrow_funded"),
+            Symbol::new(env, "escrow_funded"),
             -amount,
         );
 
         Self::emit_escrow_created(
-            &env,
+            env,
             EscrowEvent {
                 schema_version: 1,
                 escrow_id: order_id as u64,
@@ -5762,6 +5960,54 @@ impl CraftNexusContract {
         total_fees
     }
 
+    /// Release funds to seller with platform fee deduction and optional idempotency key (#1025).
+    ///
+    /// If an idempotency key is provided and was already used by this buyer for this order,
+    /// returns `Ok(())` without executing duplicate token transfers or fee deductions.
+    /// If used with different parameters or by a different operation/caller, returns `Error::IdempotencyMismatch`.
+    pub fn release_funds_idempotent(
+        env: Env,
+        order_id: u32,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
+        let escrow_for_auth = Self::get_stored_escrow(&env, order_id);
+
+        // Only buyer can release funds
+        escrow_for_auth.buyer.require_auth();
+
+        let mut hasher_bytes = Bytes::new(&env);
+        hasher_bytes.append(&order_id.to_xdr(&env));
+        let params_hash: BytesN<32> = env.crypto().sha256(&hasher_bytes).into();
+
+        if let Some(existing_order_id) = Self::check_idempotency(
+            &env,
+            &escrow_for_auth.buyer,
+            &idempotency_key,
+            IdempotencyOp::ReleaseFunds,
+            &params_hash,
+        )? {
+            if existing_order_id == order_id {
+                return Ok(());
+            } else {
+                return Err(Error::IdempotencyMismatch);
+            }
+        }
+
+        Self::release_funds_internal(&env, order_id, &escrow_for_auth)?;
+
+        Self::record_idempotency(
+            &env,
+            &escrow_for_auth.buyer,
+            &idempotency_key,
+            IdempotencyOp::ReleaseFunds,
+            order_id,
+            params_hash,
+        );
+
+        Ok(())
+    }
+
     /// Release funds to seller with platform fee deduction
     ///
     /// # Arguments
@@ -5773,17 +6019,25 @@ impl CraftNexusContract {
         // Only buyer can release funds
         escrow_for_auth.buyer.require_auth();
 
+        Self::release_funds_internal(&env, order_id, &escrow_for_auth)
+            .unwrap_or_else(|e| env.panic_with_error(e));
+    }
+
+    fn release_funds_internal(
+        env: &Env,
+        order_id: u32,
+        _escrow_for_auth: &Escrow,
+    ) -> Result<(), Error> {
         let mut escrow =
-            Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::ReleasePending)
-                .unwrap_or_else(|e| env.panic_with_error(e));
+            Self::claim_active_escrow_transition(env, order_id, EscrowStatus::ReleasePending)?;
 
         // Get platform config
-        let config = Self::get_platform_config_internal(&env);
+        let config = Self::get_platform_config_internal(env);
 
         // Deterministic fee allocation via the central FeePolicy engine.
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
         let allocation = Self::compute_fee_allocation(
-            &env,
+            env,
             escrow.amount,
             fee_bps,
             SettlementKind::ReleaseFunds,
@@ -5794,19 +6048,19 @@ impl CraftNexusContract {
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
 
         // Decrement active counts
-        Self::update_active_obligations(&env, &escrow.buyer, -1);
-        Self::update_active_obligations(&env, &escrow.seller, -1);
+        Self::update_active_obligations(env, &escrow.buyer, -1);
+        Self::update_active_obligations(env, &escrow.seller, -1);
 
-        Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
-        Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+        Self::safe_update_active_contracts(env, escrow.buyer.clone(), -1);
+        Self::safe_update_active_contracts(env, escrow.seller.clone(), -1);
 
         // Reserve accounting is part of the effects phase.
-        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+        Self::update_total_locked(env, &escrow.token, -escrow.amount);
 
         // Transfer platform fee to platform wallet
         if allocation.platform_fee > 0 {
             Self::transfer_platform_fee(
-                &env,
+                env,
                 &escrow.token,
                 &config.platform_wallet,
                 allocation.platform_fee,
@@ -5815,18 +6069,18 @@ impl CraftNexusContract {
 
         // Transfer net funds to seller and record audit
         Self::transfer_tokens_and_record_audit(
-            &env,
+            env,
             &escrow.token,
             &env.current_contract_address(),
             &escrow.seller,
             allocation.seller_amount,
             &escrow.seller,
-            Symbol::new(&env, "escrow_released"),
+            Symbol::new(env, "escrow_released"),
             allocation.seller_amount,
         );
 
         Self::emit_escrow_created(
-            &env,
+            env,
             EscrowEvent {
                 schema_version: 1,
                 escrow_id: order_id as u64,
@@ -5839,10 +6093,10 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events â€” decoupled from onboarding contract (#211)
+        // Emit reputation update events — decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.seller.clone(),
                 successful_delta: 1,
@@ -5854,7 +6108,7 @@ impl CraftNexusContract {
             },
         );
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.buyer.clone(),
                 successful_delta: 1,
@@ -5865,6 +6119,8 @@ impl CraftNexusContract {
                 timestamp: ts,
             },
         );
+
+        Ok(())
     }
 
     /// Auto-release funds after release window (seller can call)
@@ -6671,6 +6927,54 @@ impl CraftNexusContract {
         }
     }
 
+    /// Refund funds to buyer with an optional idempotency key (admin only) (#1025).
+    ///
+    /// If an idempotency key is provided and was already used by the admin for this escrow,
+    /// returns `Ok(())` without executing duplicate token transfers or state updates.
+    /// If used with different parameters or by a different operation/caller, returns `Error::IdempotencyMismatch`.
+    pub fn refund_idempotent(
+        env: Env,
+        escrow_id: u64,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let order_id = escrow_id as u32;
+
+        let mut hasher_bytes = Bytes::new(&env);
+        hasher_bytes.append(&escrow_id.to_xdr(&env));
+        let params_hash: BytesN<32> = env.crypto().sha256(&hasher_bytes).into();
+
+        if let Some(existing_order_id) = Self::check_idempotency(
+            &env,
+            &admin,
+            &idempotency_key,
+            IdempotencyOp::Refund,
+            &params_hash,
+        )? {
+            if existing_order_id == order_id {
+                return Ok(());
+            } else {
+                return Err(Error::IdempotencyMismatch);
+            }
+        }
+
+        Self::refund_internal(&env, escrow_id)?;
+
+        Self::record_idempotency(
+            &env,
+            &admin,
+            &idempotency_key,
+            IdempotencyOp::Refund,
+            order_id,
+            params_hash,
+        );
+
+        Ok(())
+    }
+
     /// Refund funds to buyer (admin only)
     ///
     /// # Arguments
@@ -6680,13 +6984,17 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
+        Self::refund_internal(&env, escrow_id)
+    }
+
+    fn refund_internal(env: &Env, escrow_id: u64) -> Result<(), Error> {
         let order_id = escrow_id as u32;
         let mut escrow =
-            Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::RefundPending)?;
+            Self::claim_active_escrow_transition(env, order_id, EscrowStatus::RefundPending)?;
 
         // Deterministic fee allocation via the central FeePolicy engine.
         let allocation =
-            Self::compute_fee_allocation(&env, escrow.amount, 0, SettlementKind::FullRefundNoFee);
+            Self::compute_fee_allocation(env, escrow.amount, 0, SettlementKind::FullRefundNoFee);
 
         // CEI: persist the Refunded state before any external token transfer.
         escrow.status = EscrowStatus::Refunded;
@@ -6704,18 +7012,18 @@ impl CraftNexusContract {
 
         // Refund to buyer and record audit
         Self::transfer_tokens_and_record_audit(
-            &env,
+            env,
             &escrow.token,
             &env.current_contract_address(),
             &escrow.buyer,
             allocation.buyer_amount,
             &escrow.buyer,
-            Symbol::new(&env, "refund"),
+            Symbol::new(env, "refund"),
             allocation.buyer_amount,
         );
 
         Self::emit_escrow_created(
-            &env,
+            env,
             EscrowEvent {
                 schema_version: 1,
                 escrow_id,
@@ -6728,10 +7036,10 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events â€” decoupled from onboarding contract (#211)
+        // Emit reputation update events — decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.buyer.clone(),
                 successful_delta: 1,
@@ -6743,7 +7051,7 @@ impl CraftNexusContract {
             },
         );
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.seller.clone(),
                 successful_delta: 0,
