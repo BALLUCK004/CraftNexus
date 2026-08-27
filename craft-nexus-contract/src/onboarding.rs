@@ -30,6 +30,7 @@
 //! | [`OnboardingContract::get_trust_score`] | `u32` | Decaying trust score (#939); lazy-applies decay on read. |
 //! | [`OnboardingContract::get_reputation_history`] | `Vec<ReputationHistoryEntry>` | Recent score-change log for abuse detection (#939). |
 //! | [`OnboardingContract::get_reputation_policy`] | [`ReputationPolicy`] | Decay / cooldown / anti-farming policy (#939). |
+//! | [`OnboardingContract::get_min_reputation_settlement`] | `i128` | Minimum 7-decimal normalized settlement eligible for trust. |
 //! | [`OnboardingContract::get_verification_history`] | `Vec<VerificationEntry>` | Compact entries decoded to human-readable actions. |
 //! | [`OnboardingContract::get_verification_queue`] | `Vec<Address>` | Pending manual-verification requests in FIFO order. |
 //! | [`OnboardingContract::get_config`] | [`OnboardingConfig`] | Global contract configuration. |
@@ -72,6 +73,7 @@
 //! - **Inbound:** the escrow contract — the address stored in
 //!   [`OnboardingConfig::escrow_contract`] — is the only authorized caller of
 //!   [`OnboardingContract::update_reputation`],
+//!   [`OnboardingContract::update_reputation_for_settlement`],
 //!   [`OnboardingContract::update_user_metrics`], and
 //!   [`OnboardingContract::update_active_contracts`]. When `escrow_contract` is
 //!   `None`, the `platform_admin` is used as the authorized fallback.
@@ -160,6 +162,9 @@ const DEFAULT_REPUTATION_UPDATE_COOLDOWN_SECS: u64 = 60 * 60;
 const DEFAULT_REPUTATION_FARMING_WINDOW_SECS: u64 = 24 * 60 * 60;
 /// Max successful-trade increments credited inside one farming window.
 const DEFAULT_MAX_SUCCESSFUL_PER_WINDOW: u32 = 5;
+/// Minimum completed-settlement value eligible for a trust-score increase.
+/// Values are normalized to the platform's 7-decimal base before comparison.
+const DEFAULT_MIN_REPUTATION_SETTLEMENT: i128 = 10_000_000;
 /// Bounded reputation history retained per user for abuse-pattern detection.
 const MAX_REPUTATION_HISTORY: u32 = 20;
 /// Cap decay intervals applied in one call to bound CPU (≈ 64 periods).
@@ -227,6 +232,8 @@ pub enum DataKey {
     ReputationState(Address),
     /// Global reputation decay / cooldown / anti-farming policy (#939)
     ReputationPolicy,
+    /// Minimum normalized completed-settlement value eligible for reputation.
+    MinimumReputationSettlement,
     /// Count of compact reputation history entries per user (#939)
     ReputationHistoryCount(Address),
     /// Indexed compact reputation history entry (#939)
@@ -842,13 +849,15 @@ enum ReputationReasonCode {
     CooldownBlocked = 1,
     /// Successful delta reduced or zeroed by the farming-window cap.
     FarmingCapped = 2,
+    /// Successful delta rejected because no meaningful settlement value was supplied.
+    BelowMinimumSettlement = 3,
 }
 
 /// Public reputation history entry returned to clients (#939).
 ///
 /// Indexers and abuse-detection tooling reconstruct farming / cooldown patterns
 /// from this log. `reason` is one of `"applied"`, `"cooldown_blocked"`,
-/// `"farming_capped"`.
+/// `"farming_capped"`, `"below_minimum_settlement"`.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -1701,6 +1710,26 @@ impl OnboardingContract {
             .unwrap_or_else(Self::default_reputation_policy)
     }
 
+    fn get_minimum_reputation_settlement_internal(env: &Env) -> i128 {
+        Self::read_persistent(env, &DataKey::MinimumReputationSettlement)
+            .unwrap_or(DEFAULT_MIN_REPUTATION_SETTLEMENT)
+    }
+
+    /// Convert a token-native amount to the platform's 7-decimal base.
+    fn normalize_token_amount(env: &Env, amount: i128, token_address: &Address) -> i128 {
+        let token_client = token::Client::new(env, token_address);
+        let token_decimals = token_client.decimals();
+        let base_decimals = 7u32;
+
+        if token_decimals < base_decimals {
+            amount.saturating_mul(10i128.pow(base_decimals - token_decimals))
+        } else if token_decimals > base_decimals {
+            amount / 10i128.pow(token_decimals - base_decimals)
+        } else {
+            amount
+        }
+    }
+
     /// Load or initialize per-user reputation state.
     fn get_or_init_reputation_state(env: &Env, user: &Address) -> ReputationState {
         let key = DataKey::ReputationState(user.clone());
@@ -1838,6 +1867,9 @@ impl OnboardingContract {
             ReputationReasonCode::Applied => Symbol::new(env, "applied"),
             ReputationReasonCode::CooldownBlocked => Symbol::new(env, "cooldown_blocked"),
             ReputationReasonCode::FarmingCapped => Symbol::new(env, "farming_capped"),
+            ReputationReasonCode::BelowMinimumSettlement => {
+                Symbol::new(env, "below_minimum_settlement")
+            }
         }
     }
 
@@ -3664,19 +3696,7 @@ impl OnboardingContract {
             .saturating_add(escrow_count_delta);
 
         // Normalize volume to 7 decimals (base decimal for auto-verification thresholds)
-        let token_client = token::Client::new(&env, &token_address);
-        let token_decimals = token_client.decimals();
-        let base_decimals = 7u32;
-
-        let normalized_delta = if token_decimals < base_decimals {
-            let diff = base_decimals - token_decimals;
-            volume_delta.saturating_mul(10i128.pow(diff))
-        } else if token_decimals > base_decimals {
-            let diff = token_decimals - base_decimals;
-            volume_delta / 10i128.pow(diff)
-        } else {
-            volume_delta
-        };
+        let normalized_delta = Self::normalize_token_amount(&env, volume_delta, &token_address);
 
         metrics.total_volume = metrics
             .total_volume
@@ -4259,7 +4279,69 @@ impl OnboardingContract {
             None => config.platform_admin.require_auth(),
         }
 
-        let mut profile = match Self::try_get_user_profile(&env, address.clone()) {
+        Self::apply_reputation_update(&env, &address, successful_delta, disputed_delta, None);
+    }
+
+    /// Apply reputation for a completed settlement after checking its value.
+    ///
+    /// Successful credit is eligible only when `settlement_amount`, normalized
+    /// to 7 decimals using `token_address`, meets the configured minimum.
+    /// Disputes always apply. Rejected low-value attempts are appended to the
+    /// score history but do not consume cooldown or farming-window capacity.
+    pub fn update_reputation_for_settlement(
+        env: Env,
+        address: Address,
+        successful_delta: u32,
+        disputed_delta: u32,
+        settlement_amount: i128,
+        token_address: Address,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        match config.escrow_contract {
+            Some(ref escrow_addr) => escrow_addr.require_auth(),
+            None => config.platform_admin.require_auth(),
+        }
+
+        if successful_delta == 0 && disputed_delta == 0 {
+            return;
+        }
+
+        let normalized_amount = if successful_delta > 0 && settlement_amount > 0 {
+            Self::normalize_token_amount(&env, settlement_amount, &token_address)
+        } else {
+            0
+        };
+        let below_minimum = successful_delta > 0
+            && (settlement_amount <= 0
+                || normalized_amount < Self::get_minimum_reputation_settlement_internal(&env));
+
+        Self::apply_reputation_update(
+            &env,
+            &address,
+            successful_delta,
+            disputed_delta,
+            if below_minimum {
+                Some(ReputationReasonCode::BelowMinimumSettlement)
+            } else {
+                None
+            },
+        );
+    }
+
+    fn apply_reputation_update(
+        env: &Env,
+        address: &Address,
+        successful_delta: u32,
+        disputed_delta: u32,
+        successful_rejection: Option<ReputationReasonCode>,
+    ) {
+        let mut profile = match Self::try_get_user_profile(env, address.clone()) {
             Some(p) => p,
             None => return, // User not onboarded; skip silently
         };
@@ -4268,12 +4350,14 @@ impl OnboardingContract {
             return;
         }
 
-        let policy = Self::get_reputation_policy_internal(&env);
-        let mut state = Self::get_or_init_reputation_state(&env, &address);
-        Self::apply_reputation_decay(&env, &mut state, &policy);
+        let policy = Self::get_reputation_policy_internal(env);
+        let mut state = Self::get_or_init_reputation_state(env, address);
+        Self::apply_reputation_decay(env, &mut state, &policy);
 
-        let (successful_applied, success_reason) =
-            Self::credit_successful_delta(&env, &mut state, &policy, successful_delta);
+        let (successful_applied, success_reason) = match successful_rejection {
+            Some(reason) => (0, reason),
+            None => Self::credit_successful_delta(env, &mut state, &policy, successful_delta),
+        };
         // Adverse outcomes always apply — cooldown/farming must not shield bad actors.
         let disputed_applied = disputed_delta;
 
@@ -4297,11 +4381,11 @@ impl OnboardingContract {
                 .saturating_add(successful_applied);
         }
 
-        Self::persist_public_user_profile(&env, &address, &profile);
-        Self::persist_reputation_state(&env, &address, &state);
+        Self::persist_public_user_profile(env, address, &profile);
+        Self::persist_reputation_state(env, address, &state);
         Self::append_reputation_history(
-            &env,
-            &address,
+            env,
+            address,
             successful_delta,
             disputed_delta,
             successful_applied,
@@ -4420,6 +4504,30 @@ impl OnboardingContract {
     /// Read the active reputation decay / anti-farming policy (#939).
     pub fn get_reputation_policy(env: Env) -> ReputationPolicy {
         Self::get_reputation_policy_internal(&env)
+    }
+
+    /// Read the minimum 7-decimal normalized settlement value for reputation.
+    pub fn get_min_reputation_settlement(env: Env) -> i128 {
+        Self::get_minimum_reputation_settlement_internal(&env)
+    }
+
+    /// Set the minimum completed-settlement value eligible for reputation.
+    pub fn set_min_reputation_settlement(env: Env, minimum_amount: i128) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        if minimum_amount < 0 {
+            env.panic_with_error(Error::InvalidReputationPolicy);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinimumReputationSettlement, &minimum_amount);
+        Self::extend_persistent(&env, &DataKey::MinimumReputationSettlement);
     }
 
     /// Set the reputation decay / anti-farming policy (admin only, #939).

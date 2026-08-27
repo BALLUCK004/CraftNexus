@@ -1093,6 +1093,133 @@ fn test_reputation_policy_defaults_on_initialize() {
         policy.max_successful_per_window,
         DEFAULT_MAX_SUCCESSFUL_PER_WINDOW
     );
+    assert_eq!(
+        client.get_min_reputation_settlement(),
+        DEFAULT_MIN_REPUTATION_SETTLEMENT
+    );
+}
+
+/// Low-value completions are audited without changing score or consuming limits.
+#[test]
+fn test_reputation_requires_meaningful_completed_settlement() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 2_000);
+
+    let (client, _) = setup_test(&env);
+    client.set_reputation_policy(&1_000_000u64, &0u32, &3_600u64, &86_400u64, &2u32);
+    client.set_min_reputation_settlement(&10_000_000i128);
+
+    let token = register_decimal_test_token(&env, 7);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "settle1"),
+        &UserRole::Artisan,
+    );
+
+    // Repeated dust settlements never gain trust or consume the account cap.
+    for _ in 0..3 {
+        client.update_reputation_for_settlement(&user, &1u32, &0u32, &9_999_999i128, &token);
+    }
+    assert_eq!(client.get_trust_score(&user), 0);
+    assert_eq!(client.get_user_reputation(&user), (0, 0));
+    assert_eq!(
+        client.get_reputation_state(&user).window_successful_applied,
+        0
+    );
+
+    // A meaningful completion at the same timestamp still receives its score.
+    client.update_reputation_for_settlement(&user, &1u32, &0u32, &10_000_000i128, &token);
+    assert_eq!(client.get_trust_score(&user), 1);
+    assert_eq!(client.get_user_reputation(&user), (1, 0));
+
+    // A second qualifying completion is still subject to the normal cooldown.
+    client.update_reputation_for_settlement(&user, &1u32, &0u32, &10_000_000i128, &token);
+    assert_eq!(client.get_trust_score(&user), 1);
+    assert_eq!(client.get_user_reputation(&user), (1, 0));
+
+    let history = client.get_reputation_history(&user);
+    assert_eq!(history.len(), 5);
+    for index in 0..3 {
+        let entry = history.get(index).unwrap();
+        assert_eq!(entry.reason, Symbol::new(&env, "below_minimum_settlement"));
+        assert_eq!(entry.successful_requested, 1);
+        assert_eq!(entry.successful_applied, 0);
+        assert_eq!(entry.trust_score_after, 0);
+    }
+    assert_eq!(history.get(3).unwrap().reason, Symbol::new(&env, "applied"));
+    assert_eq!(
+        history.get(4).unwrap().reason,
+        Symbol::new(&env, "cooldown_blocked")
+    );
+}
+
+/// Settlement thresholds compare normalized values across token decimals.
+#[test]
+fn test_reputation_minimum_settlement_normalizes_token_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    set_permissive_reputation_policy(&client);
+    client.set_min_reputation_settlement(&10_000_000i128);
+
+    let six_decimal_token = register_decimal_test_token(&env, 6);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "settle2"),
+        &UserRole::Artisan,
+    );
+
+    // One whole 6-decimal token normalizes to one whole 7-decimal token.
+    client.update_reputation_for_settlement(
+        &user,
+        &1u32,
+        &0u32,
+        &1_000_000i128,
+        &six_decimal_token,
+    );
+    assert_eq!(client.get_trust_score(&user), 1);
+}
+
+/// Adverse outcomes cannot be hidden behind the minimum-settlement gate.
+#[test]
+fn test_reputation_low_value_settlement_still_applies_dispute() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    set_permissive_reputation_policy(&client);
+    let token = register_decimal_test_token(&env, 7);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "settle3"),
+        &UserRole::Artisan,
+    );
+
+    client.update_reputation(&user, &2u32, &0u32);
+    client.update_reputation_for_settlement(&user, &1u32, &1u32, &1i128, &token);
+
+    assert_eq!(client.get_trust_score(&user), 1);
+    assert_eq!(client.get_user_reputation(&user), (2, 1));
+    let history = client.get_reputation_history(&user);
+    let last = history.get(history.len() - 1).unwrap();
+    assert_eq!(last.successful_applied, 0);
+    assert_eq!(last.disputed_applied, 1);
+    assert_eq!(last.reason, Symbol::new(&env, "below_minimum_settlement"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_minimum_reputation_settlement_rejects_negative_value() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    client.set_min_reputation_settlement(&-1i128);
 }
 
 /// Successful reputation gains are blocked by the update cooldown.
