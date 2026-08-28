@@ -211,10 +211,6 @@ pub enum Error {
     BatchJobUnauthorized = 60,
     /// The scheduled batch has already reached a terminal state.
     BatchJobCompleted = 61,
-    /// Pagination limit is zero; caller must request at least one item (#1022).
-    PaginationLimitZero = 80,
-    /// Pagination cursor is invalid (past end of dataset or empty dataset) (#1022).
-    PaginationCursorInvalid = 81,
     /// Platform wallet cannot be the contract address.
     InvalidPlatformWallet = 62,
     /// Provided service-agreement hash is invalid
@@ -255,10 +251,14 @@ pub enum Error {
     OnboardingProfileStale = 78,
     /// The user's verification status has been revoked or is not current.
     OnboardingVerificationRevoked = 79,
+    /// Pagination limit is zero; caller must request at least one item (#1022).
+    PaginationLimitZero = 80,
+    /// Pagination cursor is invalid (past end of dataset or empty dataset) (#1022).
+    PaginationCursorInvalid = 81,
     /// An escrow with this order ID already exists. Duplicate escrow
     /// identifiers are rejected so a retry (or a conflicting external
     /// reference) can never overwrite an existing escrow's state.
-    EscrowAlreadyExists = 80,
+    EscrowAlreadyExists = 82,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -651,6 +651,10 @@ pub enum DataKey {
     RateLimitCount(Address, u64),
     /// Platform rate limit configuration (max_calls, window) (#943)
     RateLimitConfig,
+    /// Bounded evidence challenge window for a disputed order (#942).
+    /// Stores the immutable deadline and closure state so the window
+    /// closes exactly once and finalization is blocked until the deadline.
+    EvidenceChallenge(u32),
 }
 
 #[contracttype]
@@ -1653,6 +1657,37 @@ pub struct DisputeEscalationRecord {
 pub struct RateLimitConfig {
     pub max_calls: u32,
     pub window: u32,
+}
+
+/// Challenge window state for a disputed escrow (#942).
+///
+/// Tracks the bounded period during which participants may challenge
+/// evidence before the dispute can be finalized. The window closes
+/// exactly once — the `Closed` state is terminal and cannot be reopened.
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum ChallengeState {
+    /// Window is open; counter-evidence may be submitted and finalization is blocked.
+    Open = 0,
+    /// Window has been closed (deadline elapsed and dispute finalized); no further challenges.
+    Closed = 1,
+}
+
+/// Persisted challenge window for a disputed order (#942).
+///
+/// Stores the immutable deadline computed at dispute time so that a later
+/// admin change to `evidence_challenge_window` cannot shorten or extend
+/// the window for an in-flight dispute. The `state` field guarantees the
+/// window closes exactly once — resolution atomically transitions `Open` → `Closed`.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct EvidenceChallenge {
+    pub order_id: u32,
+    pub deadline: u64,
+    pub state: ChallengeState,
+    pub evidence_count: u32,
 }
 
 /// Partial refund proposal created during a dispute (Issue #101)
@@ -5253,21 +5288,129 @@ impl CraftNexusContract {
         Ok((seller_gross, allocation))
     }
 
+    // ── Evidence challenge window helpers (#942) ──────────────────────────────
+
+    fn challenge_key(order_id: u32) -> DataKey {
+        DataKey::EvidenceChallenge(order_id)
+    }
+
+    fn create_evidence_challenge(env: &Env, order_id: u32, deadline: u64) {
+        let key = Self::challenge_key(order_id);
+        // Guard against duplicate creation — dispute can only open once.
+        if env.storage().persistent().has(&key) {
+            return;
+        }
+        let challenge = EvidenceChallenge {
+            order_id,
+            deadline,
+            state: ChallengeState::Open,
+            evidence_count: 0,
+        };
+        env.storage().persistent().set(&key, &challenge);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn fetch_evidence_challenge(env: &Env, order_id: u32) -> Option<EvidenceChallenge> {
+        let key = Self::challenge_key(order_id);
+        let val: Option<EvidenceChallenge> = env.storage().persistent().get(&key);
+        if val.is_some() {
+            Self::extend_persistent(env, &key);
+        }
+        val
+    }
+
+    fn close_evidence_challenge(env: &Env, order_id: u32) -> Result<(), Error> {
+        let key = Self::challenge_key(order_id);
+        if let Some(mut challenge) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EvidenceChallenge>(&key)
+        {
+            if challenge.state == ChallengeState::Closed {
+                return Err(Error::SettlementAlreadyFinalized);
+            }
+            challenge.state = ChallengeState::Closed;
+            env.storage().persistent().set(&key, &challenge);
+            Self::extend_persistent(env, &key);
+            Ok(())
+        } else {
+            // Legacy disputes without a challenge record: create a closed marker
+            // to prevent reopening. Deadline is the current timestamp.
+            let challenge = EvidenceChallenge {
+                order_id,
+                deadline: env.ledger().timestamp(),
+                state: ChallengeState::Closed,
+                evidence_count: 0,
+            };
+            env.storage().persistent().set(&key, &challenge);
+            Self::extend_persistent(env, &key);
+            Ok(())
+        }
+    }
+
+    fn challenge_deadline(env: &Env, order_id: u32, escrow: &Escrow, config: &PlatformConfig) -> u64 {
+        if let Some(challenge) = Self::fetch_evidence_challenge(env, order_id) {
+            challenge.deadline
+        } else {
+            // Fallback for legacy escrows created before challenge feature
+            let initiated_at = escrow
+                .dispute_initiated_at
+                .unwrap_or(escrow.created_at as u64);
+            initiated_at + config.evidence_challenge_window as u64
+        }
+    }
+
+    fn is_challenge_closed(env: &Env, order_id: u32) -> bool {
+        if let Some(challenge) = Self::fetch_evidence_challenge(env, order_id) {
+            challenge.state == ChallengeState::Closed
+        } else {
+            false
+        }
+    }
+
+    fn assert_challenge_window_closed(
+        env: &Env,
+        order_id: u32,
+        escrow: &Escrow,
+        config: &PlatformConfig,
+    ) -> Result<(), Error> {
+        // SettlementAlreadyFinalized takes precedence over ChallengeWindowActive
+        if Self::is_challenge_closed(env, order_id) || Self::has_settlement_receipt(env, order_id) {
+            return Err(Error::SettlementAlreadyFinalized);
+        }
+        let deadline = Self::challenge_deadline(env, order_id, escrow, config);
+        let now = env.ledger().timestamp();
+        if time_policy::is_deadline_pending(now, deadline) {
+            return Err(Error::ChallengeWindowActive);
+        }
+        Ok(())
+    }
+
     fn assert_arbitrator_resolution_window(
         env: &Env,
         escrow: &Escrow,
         config: &PlatformConfig,
     ) -> Result<(), Error> {
-        let initiated_at = Self::dispute_clock(escrow)?;
+        let order_id = escrow.id as u32;
+        // Use stored challenge deadline if available — immutable after dispute creation
+        let deadline = Self::challenge_deadline(env, order_id, escrow, config);
         let now = env.ledger().timestamp();
-        let challenge = config.evidence_challenge_window as u64;
-        // Time policy: challenge window is active while now < initiated_at + challenge_window
-        if time_policy::is_window_active(now, initiated_at, challenge) {
+        // Challenge window is active while now < deadline (pending)
+        if time_policy::is_deadline_pending(now, deadline) {
+            // But if challenge already closed, surface SettlementAlreadyFinalized instead
+            if Self::is_challenge_closed(env, order_id) {
+                return Err(Error::SettlementAlreadyFinalized);
+            }
             return Err(Error::ChallengeWindowActive);
         }
+        let initiated_at = Self::dispute_clock(escrow)?;
         // Time policy: arbitrator deadline exceeded when now >= initiated_at + max_dispute_duration
         if time_policy::is_window_elapsed(now, initiated_at, config.max_dispute_duration as u64) {
             return Err(Error::ArbitratorDeadlineExceeded);
+        }
+        // Also block if settlement already finalized
+        if Self::has_settlement_receipt(env, order_id) {
+            return Err(Error::SettlementAlreadyFinalized);
         }
         Ok(())
     }
@@ -5330,6 +5473,12 @@ impl CraftNexusContract {
         path: SettlementPath,
         proposal_nonce: u64,
     ) -> Escrow {
+        // Close challenge window exactly once — guard against re-entry.
+        // This is the sole transition Open → Closed for this order_id.
+        if Self::is_challenge_closed(env, order_id) {
+            env.panic_with_error(crate::Error::SettlementAlreadyFinalized);
+        }
+        let _ = Self::close_evidence_challenge(env, order_id);
         escrow.status = EscrowStatus::Resolved;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
         Self::write_settlement_receipt(env, order_id, path, proposal_nonce);
@@ -7012,6 +7161,13 @@ impl CraftNexusContract {
                                                       // downstream timers (evidence window, escalation window, max duration).
         escrow.dispute_initiated_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        // Create bounded challenge window for this dispute (#942).
+        // Deadline is immutable — computed once at dispute time so later
+        // config changes cannot shorten or extend it.
+        let config_for_challenge = Self::get_platform_config_internal(&env);
+        let challenge_deadline =
+            env.ledger().timestamp() + config_for_challenge.evidence_challenge_window as u64;
+        Self::create_evidence_challenge(&env, order_id, challenge_deadline);
         // Increment the global active dispute counter used by emergency-op
         // guards (admin recovery, upgrade proposals) to detect unsafe conditions.
         Self::update_active_dispute_count(&env, 1);
@@ -7289,10 +7445,29 @@ impl CraftNexusContract {
 
         log.push_back(evidence);
         env.storage().persistent().set(&key, &log);
+        // Track challenge evidence count — bounded window state
+        Self::bump_challenge_evidence_count(&env, order_id);
         id
     }
 
+    fn bump_challenge_evidence_count(env: &Env, order_id: u32) {
+        let key = Self::challenge_key(order_id);
+        if let Some(mut challenge) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EvidenceChallenge>(&key)
+        {
+            challenge.evidence_count = challenge.evidence_count.saturating_add(1);
+            env.storage().persistent().set(&key, &challenge);
+            Self::extend_persistent(env, &key);
+        }
+    }
+
     /// Submit counter-evidence responding to a prior evidence entry (#927).
+    ///
+    /// Counter-evidence is explicitly linked to its parent via `parent_evidence_id`
+    /// so that the challenge chain is auditable and the parent can be verified
+    /// to belong to the same dispute session.
     pub fn submit_counter_evidence(
         env: Env,
         order_id: u32,
@@ -7323,6 +7498,7 @@ impl CraftNexusContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         // Validate parent evidence ID exists in current dispute evidence log
+        // Counter-evidence must be linked to an existing submission in the same session
         let mut parent_found = false;
         for item in log.iter() {
             if item.id == parent_evidence_id && item.dispute_session_id == dispute_session_id {
@@ -7331,7 +7507,7 @@ impl CraftNexusContract {
             }
         }
         if !parent_found {
-            env.panic_with_error(crate::Error::InvalidEscrowState);
+            env.panic_with_error(crate::Error::InvalidDisputeAction);
         }
 
         // Prevent evidence reuse across multiple disputes (#927)
@@ -7364,6 +7540,7 @@ impl CraftNexusContract {
 
         log.push_back(evidence);
         env.storage().persistent().set(&key, &log);
+        Self::bump_challenge_evidence_count(&env, order_id);
         id
     }
 
@@ -7476,6 +7653,75 @@ impl CraftNexusContract {
         env.storage()
             .instance()
             .set(&DataKey::PlatformConfig, &config);
+    }
+
+    /// Retrieve the persisted challenge window for a disputed order (#942).
+    ///
+    /// Returns `None` if the escrow has never been disputed (no challenge
+    /// record exists).  The returned `deadline` is the immutable timestamp
+    /// computed at dispute time; `state` indicates whether the window has
+    /// been closed exactly once via settlement.
+    pub fn get_evidence_challenge(env: Env, order_id: u32) -> Option<EvidenceChallenge> {
+        Self::fetch_evidence_challenge(&env, order_id)
+    }
+
+    /// Convenience: return only the stored challenge deadline, if any.
+    pub fn get_challenge_deadline(env: Env, order_id: u32) -> Option<u64> {
+        Self::fetch_evidence_challenge(&env, order_id).map(|c| c.deadline)
+    }
+
+    /// Returns true while the challenge window is still open (deadline pending and not closed).
+    pub fn is_challenge_window_open(env: Env, order_id: u32) -> bool {
+        if let Some(challenge) = Self::fetch_evidence_challenge(&env, order_id) {
+            if challenge.state == ChallengeState::Closed {
+                return false;
+            }
+            time_policy::is_deadline_pending(env.ledger().timestamp(), challenge.deadline)
+        } else {
+            // Legacy fallback: derive from escrow if disputed
+            if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&(ESCROW, order_id)) {
+                if escrow.status == EscrowStatus::Disputed {
+                    if let Some(initiated) = escrow.dispute_initiated_at {
+                        let config = Self::get_platform_config_internal(&env);
+                        return time_policy::is_window_active(
+                            env.ledger().timestamp(),
+                            initiated,
+                            config.evidence_challenge_window as u64,
+                        );
+                    }
+                }
+            }
+            false
+        }
+    }
+
+    /// Explicitly close the challenge window after its deadline has elapsed.
+    ///
+    /// The window closes exactly once — a second call fails with
+    /// `SettlementAlreadyFinalized`. This is a permissionless finalization
+    /// guard: any account may close the window once the bounded challenge
+    /// period has elapsed, mirroring `resolve_expired_dispute`. Normal
+    /// settlement paths (`resolve_dispute`, `resolve_dispute_partial`,
+    /// `accept_partial_refund`) close the window automatically as part of
+    /// commitment, so calling this function is optional. It exists to make
+    /// the exactly-once closure testable off-chain.
+    pub fn close_challenge_window(env: Env, order_id: u32) -> Result<(), Error> {
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if Self::is_challenge_closed(&env, order_id)
+            || Self::has_settlement_receipt(&env, order_id)
+        {
+            return Err(Error::SettlementAlreadyFinalized);
+        }
+        let config = Self::get_platform_config_internal(&env);
+        let deadline = Self::challenge_deadline(&env, order_id, &escrow, &config);
+        let now = env.ledger().timestamp();
+        if time_policy::is_deadline_pending(now, deadline) {
+            return Err(Error::ChallengeWindowActive);
+        }
+        Self::close_evidence_challenge(&env, order_id)
     }
 
     /// Set rate limit configuration (admin only) (#943).
@@ -9363,6 +9609,9 @@ impl CraftNexusContract {
         let (_seller_gross, allocation) =
             Self::validate_partial_refund_solvency(&env, &snapshot, proposal.refund_amount)?;
         let config = Self::get_platform_config_internal(&env);
+        // Finalization guard: bounded challenge period must have elapsed and
+        // challenge window must not have been already closed.
+        Self::assert_arbitrator_resolution_window(&env, &snapshot, &config)?;
 
         let escrow = Self::claim_disputed_settlement(&env, order_id)?;
         let escrow = Self::commit_resolved_escrow(
