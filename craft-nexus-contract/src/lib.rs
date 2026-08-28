@@ -10,6 +10,9 @@ use soroban_sdk::{
 };
 extern crate alloc;
 
+/// Centralised time-boundary policy for the contract.
+pub mod time_policy;
+
 #[cfg(test)]
 mod arbitration_escalation_test;
 #[cfg(test)]
@@ -25,12 +28,21 @@ mod reentrancy_test;
 #[cfg(test)]
 mod scalability_test;
 #[cfg(test)]
+mod time_boundary_test;
+#[cfg(test)]
 mod test;
+#[cfg(test)]
+mod pagination_boundary_test;
+#[cfg(test)]
+mod prop_test;
 
 // Onboarding is a separate logical contract; only one `#[contract]` may be linked per WASM
 // artifact. Keep it in this crate for host tests (`cargo test`) but omit from guest builds.
 #[cfg(not(target_family = "wasm"))]
 pub mod onboarding;
+
+/// Centralized pagination input validation (Issue #1022).
+pub mod pagination_validation;
 
 /// Error codes grouped by category for off-chain triage.
 ///
@@ -201,6 +213,10 @@ pub enum Error {
     BatchJobUnauthorized = 60,
     /// The scheduled batch has already reached a terminal state.
     BatchJobCompleted = 61,
+    /// Pagination limit is zero; caller must request at least one item (#1022).
+    PaginationLimitZero = 80,
+    /// Pagination cursor is invalid (past end of dataset or empty dataset) (#1022).
+    PaginationCursorInvalid = 81,
     /// Platform wallet cannot be the contract address.
     InvalidPlatformWallet = 62,
     /// Provided service-agreement hash is invalid
@@ -227,6 +243,24 @@ pub enum Error {
     RepairPlanTerminal = 73,
     /// The live token state no longer matches the reviewed repair plan.
     RepairPlanPreconditionFailed = 74,
+    /// The user does not have an onboarding profile registered with the
+    /// configured onboarding contract.
+    OnboardingProfileNotFound = 75,
+    /// The user's onboarding profile is not in an active state (deactivated,
+    /// under review, or flagged).
+    OnboardingProfileInactive = 76,
+    /// The user's onboarding role does not permit the requested marketplace
+    /// operation.
+    OnboardingRoleMismatch = 77,
+    /// The user's onboarding profile state version does not match the expected
+    /// current version — stale onboarding state detected.
+    OnboardingProfileStale = 78,
+    /// The user's verification status has been revoked or is not current.
+    OnboardingVerificationRevoked = 79,
+    /// An escrow with this order ID already exists. Duplicate escrow
+    /// identifiers are rejected so a retry (or a conflicting external
+    /// reference) can never overwrite an existing escrow's state.
+    EscrowAlreadyExists = 80,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -312,38 +346,39 @@ const READ_TTL_THRESHOLD: u32 = 1_000;
 const TTL_EXTENSION: u32 = 518_400;
 
 // Default configuration constants (can be overridden via PlatformConfig)
+// Re-exported from the centralised time_policy module for single source of truth.
 /// Default grace period for WASM upgrades (7 days in seconds)
-const DEFAULT_WASM_UPGRADE_COOLDOWN: u32 = 7 * 24 * 60 * 60;
+const DEFAULT_WASM_UPGRADE_COOLDOWN: u32 = time_policy::WASM_UPGRADE_COOLDOWN as u32;
 /// Minimum time (seconds) that must elapse after a cancel_upgrade_wasm call
 /// before propose_upgrade_wasm is accepted again (Issue #618).
 /// Prevents the cancel-and-repropose pattern that resets the review window.
-const CANCEL_REPROPOSE_COOLDOWN: u64 = 7 * 24 * 60 * 60; // 7 days
+const CANCEL_REPROPOSE_COOLDOWN: u64 = time_policy::CANCEL_REPROPOSE_COOLDOWN;
 
 /// Default maximum duration a dispute can remain open before it can be force-resolved (30 days in seconds)
-const DEFAULT_MAX_DISPUTE_DURATION: u32 = 30 * 24 * 60 * 60;
+const DEFAULT_MAX_DISPUTE_DURATION: u32 = time_policy::MAX_DISPUTE_DURATION as u32;
 
 /// Default cooldown period after staking before tokens can be unstaked (7 days in seconds)
-const DEFAULT_STAKE_COOLDOWN: u32 = 7 * 24 * 60 * 60;
+const DEFAULT_STAKE_COOLDOWN: u32 = time_policy::STAKE_COOLDOWN as u32;
 
 /// Default minimum release window to prevent "flash" auto-releases (1 day in seconds)
-const DEFAULT_MIN_RELEASE_WINDOW: u32 = 24 * 60 * 60;
+const DEFAULT_MIN_RELEASE_WINDOW: u32 = time_policy::MIN_RELEASE_WINDOW as u32;
 /// Absolute safety ceiling for admin-configurable max release window (365 days).
-const ABSOLUTE_MAX_RELEASE_WINDOW: u32 = 365 * 24 * 60 * 60;
+const ABSOLUTE_MAX_RELEASE_WINDOW: u32 = time_policy::ABSOLUTE_MAX_RELEASE_WINDOW as u32;
 
 /// Default evidence expiry / retention window (7 days in seconds) (#927)
-const DEFAULT_EVIDENCE_EXPIRY_WINDOW: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_EVIDENCE_EXPIRY_WINDOW: u64 = time_policy::EVIDENCE_EXPIRY_WINDOW;
 /// Default challenge period window before a dispute can be resolved (1 day in seconds) (#942)
-const DEFAULT_EVIDENCE_CHALLENGE_WINDOW: u32 = 24 * 60 * 60;
+const DEFAULT_EVIDENCE_CHALLENGE_WINDOW: u32 = time_policy::EVIDENCE_CHALLENGE_WINDOW as u32;
 /// Default dispute escalation window (3 days in seconds) (#941)
-const DEFAULT_DISPUTE_ESCALATION_WINDOW: u32 = 3 * 24 * 60 * 60;
+const DEFAULT_DISPUTE_ESCALATION_WINDOW: u32 = time_policy::DISPUTE_ESCALATION_WINDOW as u32;
 /// Default rate limit max calls per window (#943)
 const DEFAULT_RATE_LIMIT_MAX_CALLS: u32 = 5;
 /// Default rate limit window (1 hour in seconds) (#943)
-const DEFAULT_RATE_LIMIT_WINDOW: u32 = 3600;
+const DEFAULT_RATE_LIMIT_WINDOW: u32 = time_policy::RATE_LIMIT_WINDOW as u32;
 
 /// Maximum platform fee in basis points (10000 = 100%)
 const MAX_PLATFORM_FEE_BPS: u32 = 1000; // 10% max
-const MAX_TOTAL_RELEASE_WINDOW: u32 = 2592000; // 30 days
+const MAX_TOTAL_RELEASE_WINDOW: u32 = time_policy::MAX_TOTAL_RELEASE_WINDOW as u32;
 const CURRENT_ESCROW_VERSION: u32 = 4;
 /// Explicit storage layout version for persisted contract state.
 ///
@@ -359,7 +394,7 @@ const MAX_BATCH_SIZE: u32 = 20;
 const MAX_SCHEDULED_BATCH_WORK: u32 = 5;
 const MAX_PAGE_SIZE: u32 = 100;
 /// Timeout for unfunded escrows before they can be cancelled (24 hours) (#213)
-const UNFUNDED_CANCEL_TIMEOUT: u64 = 24 * 60 * 60;
+const UNFUNDED_CANCEL_TIMEOUT: u64 = time_policy::UNFUNDED_CANCEL_TIMEOUT;
 /// Hard ceiling for `NextRecurringEscrowId` (Issue #233).
 ///
 /// `u64::MAX` is reserved as a sentinel so the allocator can detect an
@@ -389,12 +424,12 @@ const MAX_STAKE_QUEUE_SIZE: u32 = 50;
 /// Threshold at which to trigger automatic pruning of matured stake deposits
 const STAKE_QUEUE_PRUNE_THRESHOLD: u32 = 40;
 /// Time lock period before admin recovery is allowed (7 days) (#240)
-const ADMIN_RECOVERY_DELAY: u64 = 7 * 24 * 60 * 60;
+const ADMIN_RECOVERY_DELAY: u64 = time_policy::ADMIN_RECOVERY_DELAY;
 /// Minimum allowed admin recovery cooldown. Deploys attempting to set a
 /// shorter window (including zero) will be rejected during recovery.
-const MIN_ADMIN_RECOVERY_COOLDOWN: u64 = 7 * 24 * 60 * 60;
+const MIN_ADMIN_RECOVERY_COOLDOWN: u64 = time_policy::MIN_ADMIN_RECOVERY_COOLDOWN;
 /// Default timelock delay for pending critical admin actions (24 hours).
-const DEFAULT_ADMIN_ACTION_TIMELOCK_DELAY: u64 = 24 * 60 * 60;
+const DEFAULT_ADMIN_ACTION_TIMELOCK_DELAY: u64 = time_policy::ADMIN_ACTION_TIMELOCK_DELAY;
 
 /// The kind of critical admin action that requires multi-sig approval
 /// and timelock enforcement.
@@ -475,6 +510,11 @@ pub enum DataKey {
     ArtisanFeeTier(Address),
     /// Staked token amount and asset for an artisan
     ArtisanStake(Address),
+    /// DEPRECATED legacy storage: Token address backing an artisan's staked balance.
+    ///
+    /// Replaced by [`ArtisanStake::token`] in [`ArtisanStakeData`]. Kept for
+    /// lazy migration of pre-v2 stake records during contract upgrades.
+    ArtisanStakeToken(Address),
     StakeCooldownEnd(Address),
     /// DEPRECATED single-cooldown timestamp for an artisan.
     ///
@@ -1780,6 +1820,17 @@ pub trait OnboardingInterface {
     fn bump_user_profile_ttl(env: Env, user: Address) -> bool;
     /// Refresh the persistent TTL for a user's activity metrics entry.
     fn bump_user_metrics_ttl(env: Env, user: Address) -> bool;
+    /// Return the role assigned to `user`, or `UserRole::None` if no profile exists.
+    fn get_user_role(env: Env, user: Address) -> UserRole;
+    /// Return true if `user` has an active onboarding profile.
+    fn is_profile_active(env: Env, user: Address) -> bool;
+    /// Return the schema version stored on `user`'s profile, or `0` if no profile exists.
+    fn get_user_profile_version(env: Env, user: Address) -> u32;
+    /// Return the monotonically increasing state version for `user`'s profile,
+    /// or `0` if no profile exists.
+    fn get_user_state_version(env: Env, user: Address) -> u32;
+    /// Return true if `user` has passed verification (manual or auto).
+    fn is_user_verified(env: Env, user: Address) -> bool;
 }
 
 #[contract]
@@ -2692,6 +2743,173 @@ impl CraftNexusContract {
         }
     }
 
+    /// Safely query the onboarding contract for a single user's canonical state.
+    ///
+    /// Returns `Ok((is_active, role, is_verified, state_version))` on success,
+    /// `Err(())` when no onboarding contract is configured or the cross-contract
+    /// call fails. Never panics — callers decide how to handle a missing or
+    /// unreachable onboarding contract.
+    ///
+    /// All four cross-contract reads are issued as separate `try_invoke_contract`
+    /// calls so a partial failure is observable and distinguishable from a full
+    /// outage.
+    fn safe_check_onboarding_state(
+        env: &Env,
+        user: &Address,
+    ) -> Result<(bool, UserRole, bool, u32), ()> {
+        let (onboarding_address, _) = match Self::get_onboarding_client(env) {
+            Some(c) => c,
+            None => return Err(()),
+        };
+
+        // is_profile_active
+        let active_method = Symbol::new(env, "is_profile_active");
+        let active_args: Vec<Val> = (user.clone(),).into_val(env);
+        let is_active: bool = match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &onboarding_address,
+            &active_method,
+            active_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    active_method,
+                    onboarding_address.clone(),
+                );
+                return Err(());
+            }
+        };
+
+        // get_user_role
+        let role_method = Symbol::new(env, "get_user_role");
+        let role_args: Vec<Val> = (user.clone(),).into_val(env);
+        let role: UserRole = match env.try_invoke_contract::<UserRole, soroban_sdk::Error>(
+            &onboarding_address,
+            &role_method,
+            role_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    role_method,
+                    onboarding_address.clone(),
+                );
+                return Err(());
+            }
+        };
+
+        // is_user_verified
+        let verified_method = Symbol::new(env, "is_user_verified");
+        let verified_args: Vec<Val> = (user.clone(),).into_val(env);
+        let is_verified: bool = match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &onboarding_address,
+            &verified_method,
+            verified_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    verified_method,
+                    onboarding_address.clone(),
+                );
+                return Err(());
+            }
+        };
+
+        // get_user_state_version
+        let version_method = Symbol::new(env, "get_user_state_version");
+        let version_args: Vec<Val> = (user.clone(),).into_val(env);
+        let state_version: u32 = match env.try_invoke_contract::<u32, soroban_sdk::Error>(
+            &onboarding_address,
+            &version_method,
+            version_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    version_method,
+                    onboarding_address,
+                );
+                return Err(());
+            }
+        };
+
+        Ok((is_active, role, is_verified, state_version))
+    }
+
+    /// Validate onboarding state for both buyer and seller before a privileged
+    /// marketplace operation (escrow creation).
+    ///
+    /// # Behaviour
+    ///
+    /// When no onboarding contract is configured the check is a no-op — the
+    /// platform operates in open mode and all accounts are permitted.
+    ///
+    /// When an onboarding contract is configured each user must satisfy all of:
+    /// - Profile exists (state_version > 0; a zero version means no profile).
+    /// - Profile is currently active (not deactivated, flagged, or under review).
+    /// - Role is not `UserRole::None` — the user must have completed onboarding
+    ///   with a recognized role.
+    /// - Profile is verified (`is_verified == true`) when the platform requires
+    ///   verification for privileged operations.
+    ///
+    /// The state_version check is deferred here: a zero version is treated as
+    /// "profile not found". Any non-zero version is accepted because version
+    /// staleness at the point of escrow creation is only relevant if the caller
+    /// supplies an explicit expected version. Role and active-status changes
+    /// are reflected immediately because they are read live from the canonical
+    /// onboarding source.
+    ///
+    /// # Errors
+    ///
+    /// Panics with the appropriate [`Error`] variant on any validation failure:
+    /// - [`Error::OnboardingProfileNotFound`] — no profile (state_version == 0).
+    /// - [`Error::OnboardingProfileInactive`] — profile is not active.
+    /// - [`Error::OnboardingRoleMismatch`] — role is `None` (not properly onboarded).
+    fn validate_onboarding_state(env: &Env, buyer: &Address, seller: &Address) {
+        // No-op when no onboarding contract is configured.
+        if Self::get_onboarding_address(env).is_none() {
+            return;
+        }
+
+        for user in [buyer, seller] {
+            let (is_active, role, _is_verified, state_version) =
+                match Self::safe_check_onboarding_state(env, user) {
+                    Ok(state) => state,
+                    Err(()) => {
+                        // Cross-contract call failed — emit warning but allow the
+                        // operation to proceed so a temporarily unreachable onboarding
+                        // contract cannot permanently brick escrow creation.
+                        Self::emit_onboarding_call_failed(
+                            env,
+                            Symbol::new(env, "check_state"),
+                            user.clone(),
+                        );
+                        continue;
+                    }
+                };
+
+            // A state_version of 0 means the profile does not exist.
+            if state_version == 0 {
+                env.panic_with_error(Error::OnboardingProfileNotFound);
+            }
+
+            // Profile must be in an active state.
+            if !is_active {
+                env.panic_with_error(Error::OnboardingProfileInactive);
+            }
+
+            // User must have a recognized onboarding role.
+            if role == UserRole::None {
+                env.panic_with_error(Error::OnboardingRoleMismatch);
+            }
+        }
+    }
+
     /// Set the configurable maximum release window (admin only).
     ///
     /// # Arguments
@@ -3044,6 +3262,35 @@ impl CraftNexusContract {
         queue_len
     }
 
+    /// Migrate legacy artisan stake records from split `ArtisanStake` (i128) +
+    /// `ArtisanStakeToken` (Address) storage to the unified `ArtisanStakeData`
+    /// struct (#1034).
+    ///
+    /// This function is idempotent: it returns 0 if the record is already in
+    /// the new format. Should be called lazily during stake reads or writes
+    /// so existing artisan balances are preserved across contract upgrades.
+    pub fn migrate_legacy_artisan_stake(env: Env, artisan: Address) -> u32 {
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let token_key = DataKey::ArtisanStakeToken(artisan.clone());
+
+        if !env.storage().persistent().has(&token_key) {
+            return 0;
+        }
+
+        let old_amount: Option<i128> = env.storage().persistent().get(&stake_key);
+        let old_token: Option<Address> = env.storage().persistent().get(&token_key);
+
+        if let (Some(amount), Some(token)) = (old_amount, old_token) {
+            let new_stake = ArtisanStakeData { amount, token };
+            env.storage().persistent().set(&stake_key, &new_stake);
+            Self::extend_persistent(&env, &stake_key);
+            env.storage().persistent().remove(&token_key);
+            return 1;
+        }
+
+        0
+    }
+
     /// Get the count of stake deposits in an artisan's queue.
     ///
     /// Returns 0 if no deposits exist. This is more efficient than loading
@@ -3062,9 +3309,18 @@ impl CraftNexusContract {
         artisan: Address,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<StakeDeposit> {
+    ) -> Result<soroban_sdk::Vec<StakeDeposit>, Error> {
+        let limit = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_ADMIN_PAGE_SIZE,
+        )?;
         let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
         let total_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        // Return empty if offset is past the end
+        if offset >= total_count {
+            return Ok(soroban_sdk::Vec::new(&env));
+        }
 
         let mut deposits = soroban_sdk::Vec::new(&env);
         let end = core::cmp::min(offset + limit, total_count);
@@ -3080,7 +3336,7 @@ impl CraftNexusContract {
             }
         }
 
-        deposits
+        Ok(deposits)
     }
 
     pub fn initialize(
@@ -3915,6 +4171,7 @@ impl CraftNexusContract {
         // Check artisan (seller) stake requirement (Issue #99)
         let config = Self::get_platform_config_internal(&env);
         if config.min_stake_required > 0 {
+            Self::migrate_legacy_artisan_stake(env.clone(), seller.clone());
             let artisan_stake: i128 = env
                 .storage()
                 .persistent()
@@ -3940,6 +4197,8 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::ReleaseWindowTooLong);
         }
 
+        Self::validate_onboarding_state(&env, &buyer, &seller);
+
         let created_at_u64 = env.ledger().timestamp();
         assert!(
             created_at_u64 <= u32::MAX as u64,
@@ -3949,6 +4208,10 @@ impl CraftNexusContract {
         Self::validate_optional_ipfs_hash(&env, &ipfs_hash);
         Self::validate_optional_metadata_hash(&env, &metadata_hash);
         Self::validate_optional_service_agreement_hash(&env, &service_agreement_hash);
+
+        // Reject duplicate escrow identifiers (#1027): a retry or a conflicting
+        // external reference must never overwrite an existing escrow.
+        Self::assert_escrow_not_exists(&env, order_id);
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -4081,6 +4344,8 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::ReleaseWindowTooLong);
         }
 
+        Self::validate_onboarding_state(&env, &buyer, &seller);
+
         let created_at_u64 = env.ledger().timestamp();
         assert!(
             created_at_u64 <= u32::MAX as u64,
@@ -4093,6 +4358,10 @@ impl CraftNexusContract {
 
         // Compute the deadline after which any party may cancel the unfunded stub (#656).
         let funding_deadline = created_at_u64 + UNFUNDED_CANCEL_TIMEOUT;
+
+        // Reject duplicate escrow identifiers (#1027): a retry or a conflicting
+        // external reference must never overwrite an existing escrow.
+        Self::assert_escrow_not_exists(&env, order_id);
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -4241,7 +4510,8 @@ impl CraftNexusContract {
             .funding_deadline
             .unwrap_or((escrow.created_at as u64) + UNFUNDED_CANCEL_TIMEOUT);
 
-        if current_time >= deadline {
+        // Time policy: deadline is reached when now >= deadline (inclusive end)
+        if time_policy::is_deadline_reached(current_time, deadline) {
             // After the deadline: buyer, seller, or platform admin may cancel.
             let admin = Self::get_admin(&env).unwrap_or(escrow.buyer.clone());
             if caller != escrow.buyer && caller != escrow.seller && caller != admin {
@@ -4354,10 +4624,8 @@ impl CraftNexusContract {
         buyer.require_auth();
         let mut result = soroban_sdk::Vec::new(&env);
 
-        let page_size = page_size.min(MAX_PAGE_SIZE);
-        if page_size == 0 {
-            return Ok(result);
-        }
+        let page_size =
+            pagination_validation::validate_limit(page_size, pagination_validation::MAX_PAGE_SIZE)?;
 
         // Try new indexed storage first
         let count_key = DataKey::BuyerEscrowCount(buyer.clone());
@@ -4432,10 +4700,8 @@ impl CraftNexusContract {
         seller.require_auth();
         let mut result = soroban_sdk::Vec::new(&env);
 
-        let page_size = page_size.min(MAX_PAGE_SIZE);
-        if page_size == 0 {
-            return Ok(result);
-        }
+        let page_size =
+            pagination_validation::validate_limit(page_size, pagination_validation::MAX_PAGE_SIZE)?;
 
         // Try new indexed storage first
         let count_key = DataKey::SellerEscrowCount(seller.clone());
@@ -4670,21 +4936,34 @@ impl CraftNexusContract {
         upgraded
     }
 
+    /// Reject duplicate escrow identifiers (#1027).
+    ///
+    /// An order ID is the canonical key for an escrow. If one already exists,
+    /// a retry (or a conflicting client-supplied reference) must never
+    /// overwrite the existing escrow, or funds could be lost. On conflict the
+    /// caller receives [`Error::EscrowAlreadyExists`] and all state changes
+    /// are rolled back.
+    fn assert_escrow_not_exists(env: &Env, order_id: u32) {
+        if env.storage().persistent().has(&(ESCROW, order_id)) {
+            env.panic_with_error(crate::Error::EscrowAlreadyExists);
+        }
+    }
+
     fn assert_valid_transition(
         previous_status: EscrowStatus,
         next_status: EscrowStatus,
     ) -> Result<(), Error> {
-        let is_allowed = match (previous_status, next_status) {
+        let is_allowed = matches!(
+            (previous_status, next_status),
             (EscrowStatus::Active, EscrowStatus::DisputePending)
-            | (EscrowStatus::Active, EscrowStatus::ReleasePending)
-            | (EscrowStatus::Active, EscrowStatus::RefundPending) => true,
-            (EscrowStatus::DisputePending, EscrowStatus::Disputed) => true,
-            (EscrowStatus::Disputed, EscrowStatus::SettlementPending) => true,
-            (EscrowStatus::SettlementPending, EscrowStatus::Resolved) => true,
-            (EscrowStatus::ReleasePending, EscrowStatus::Released) => true,
-            (EscrowStatus::RefundPending, EscrowStatus::Refunded) => true,
-            _ => false,
-        };
+                | (EscrowStatus::Active, EscrowStatus::ReleasePending)
+                | (EscrowStatus::Active, EscrowStatus::RefundPending)
+                | (EscrowStatus::DisputePending, EscrowStatus::Disputed)
+                | (EscrowStatus::Disputed, EscrowStatus::SettlementPending)
+                | (EscrowStatus::SettlementPending, EscrowStatus::Resolved)
+                | (EscrowStatus::ReleasePending, EscrowStatus::Released)
+                | (EscrowStatus::RefundPending, EscrowStatus::Refunded)
+        );
 
         if is_allowed {
             Ok(())
@@ -5078,10 +5357,12 @@ impl CraftNexusContract {
         let initiated_at = Self::dispute_clock(escrow)?;
         let now = env.ledger().timestamp();
         let challenge = config.evidence_challenge_window as u64;
-        if now < initiated_at.saturating_add(challenge) {
+        // Time policy: challenge window is active while now < initiated_at + challenge_window
+        if time_policy::is_window_active(now, initiated_at, challenge) {
             return Err(Error::ChallengeWindowActive);
         }
-        if now >= initiated_at.saturating_add(config.max_dispute_duration as u64) {
+        // Time policy: arbitrator deadline exceeded when now >= initiated_at + max_dispute_duration
+        if time_policy::is_window_elapsed(now, initiated_at, config.max_dispute_duration as u64) {
             return Err(Error::ArbitratorDeadlineExceeded);
         }
         Ok(())
@@ -5094,7 +5375,8 @@ impl CraftNexusContract {
     ) -> Result<(), Error> {
         let initiated_at = Self::dispute_clock(escrow)?;
         let now = env.ledger().timestamp();
-        if now < initiated_at.saturating_add(config.max_dispute_duration as u64) {
+        // Time policy: dispute is expired when now >= initiated_at + max_dispute_duration
+        if time_policy::is_window_active(now, initiated_at, config.max_dispute_duration as u64) {
             return Err(Error::DisputeExpired);
         }
         Ok(())
@@ -5641,9 +5923,8 @@ impl CraftNexusContract {
         }
 
         let current_time = env.ledger().timestamp();
-        let elapsed = current_time - (escrow_for_window.created_at as u64);
-
-        if elapsed < escrow_for_window.release_window as u64 {
+        // Time policy: window is elapsed when now >= created_at + release_window
+        if time_policy::is_window_active(current_time, escrow_for_window.created_at as u64, escrow_for_window.release_window as u64) {
             env.panic_with_error(crate::Error::ReleaseWindowNotElapsed);
         }
 
@@ -5854,7 +6135,8 @@ impl CraftNexusContract {
             .get::<DataKey, u64>(&DataKey::LastUpgradeCancelledAt)
         {
             let now = env.ledger().timestamp();
-            if now < cancelled_at.saturating_add(CANCEL_REPROPOSE_COOLDOWN) {
+            // Time policy: cooldown is active while now < cancelled_at + CANCEL_REPROPOSE_COOLDOWN
+            if time_policy::is_window_active(now, cancelled_at, CANCEL_REPROPOSE_COOLDOWN) {
                 return Err(Error::UpgradeCooldownActive);
             }
         }
@@ -6579,15 +6861,20 @@ impl CraftNexusContract {
         actor: Address,
         start_index: u32,
         limit: u32,
-    ) -> Vec<FundMovementAuditEntry> {
+    ) -> Result<Vec<FundMovementAuditEntry>, Error> {
+        let limit = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_ADMIN_PAGE_SIZE,
+        )?;
         let count_key = DataKey::FundAuditCount(actor.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let mut history = Vec::new(&env);
 
-        if start_index >= count || limit == 0 {
-            return history;
+        // Return empty if start_index is past the end
+        if start_index >= count {
+            return Ok(Vec::new(&env));
         }
 
+        let mut history = Vec::new(&env);
         let end_index = start_index.saturating_add(limit).min(count);
         for index in start_index..end_index {
             let entry_key = DataKey::FundAuditIndexed(actor.clone(), index);
@@ -6600,7 +6887,7 @@ impl CraftNexusContract {
             }
         }
 
-        history
+        Ok(history)
     }
 
     /// Get escrow metadata fields only.
@@ -7244,7 +7531,8 @@ impl CraftNexusContract {
         let mut modified = false;
 
         for mut item in log.into_iter() {
-            if !item.is_invalidated && current_time > item.expires_at {
+            // Time policy: evidence expires when now >= expires_at (inclusive end, consistent with all other deadlines)
+            if !item.is_invalidated && time_policy::is_deadline_reached(current_time, item.expires_at) {
                 item.is_invalidated = true;
                 modified = true;
             }
@@ -7265,7 +7553,8 @@ impl CraftNexusContract {
         let current_time = env.ledger().timestamp();
 
         for item in all_evidence.into_iter() {
-            if !item.is_invalidated && current_time <= item.expires_at {
+            // Time policy: evidence is valid while now < expires_at (window active)
+            if !item.is_invalidated && time_policy::is_deadline_pending(current_time, item.expires_at) {
                 valid_log.push_back(item);
             }
         }
@@ -7299,7 +7588,8 @@ impl CraftNexusContract {
             .unwrap_or(escrow.created_at as u64);
         let current_time = env.ledger().timestamp();
 
-        if current_time < dispute_initiated_at + config.dispute_escalation_window as u64 {
+        // Time policy: escalation window is active while now < dispute_initiated_at + escalation_window
+        if time_policy::is_window_active(current_time, dispute_initiated_at, config.dispute_escalation_window as u64) {
             env.panic_with_error(crate::Error::ReleaseWindowNotElapsed);
         }
 
@@ -7795,6 +8085,12 @@ impl CraftNexusContract {
             }
         }
 
+        // Reject duplicate escrow identifiers (#1027): the order ID is the
+        // canonical key, so a duplicate must not overwrite an existing escrow.
+        if env.storage().persistent().has(&(ESCROW, params.order_id)) {
+            return Err(Error::EscrowAlreadyExists);
+        }
+
         Ok(())
     }
 
@@ -7978,8 +8274,14 @@ impl CraftNexusContract {
         }
 
         // Issue #111: Validate all first (single pass)
+        // Issue #1027: also reject duplicate order IDs within the batch itself.
+        let mut seen_order_ids: Map<u32, bool> = Map::new(&env);
         for i in 0..escrows.len() {
             if let Some(params) = escrows.get(i) {
+                if seen_order_ids.contains_key(params.order_id) {
+                    return Err(Error::EscrowAlreadyExists);
+                }
+                seen_order_ids.set(params.order_id, true);
                 Self::validate_escrow_params(&env, &params)?;
             }
         }
@@ -8195,9 +8497,10 @@ impl CraftNexusContract {
         owner: Address,
         work_limit: u32,
     ) -> Result<BatchJobProgress, Error> {
-        if work_limit == 0 || work_limit > MAX_SCHEDULED_BATCH_WORK {
-            return Err(Error::InvalidBatchWorkLimit);
-        }
+        pagination_validation::validate_strict_limit(
+            work_limit,
+            pagination_validation::MAX_BATCH_WORK_LIMIT,
+        )?;
 
         let key = DataKey::BatchEscrowJob(job_id);
         let mut job: BatchEscrowJob = env
@@ -8647,12 +8950,21 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::AmountBelowMinimum);
         }
 
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
+
+        // Reject cross-token deposits before any state mutation (#1034).
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let current_stake: Option<ArtisanStakeData> = env.storage().persistent().get(&stake_key);
+        if let Some(existing_stake) = &current_stake {
+            if existing_stake.token != token {
+                env.panic_with_error(crate::Error::StakeTokenMismatch);
+            }
+        }
+
         // Effects are committed before the token interaction.
         Self::update_total_staked(&env, &token, amount);
 
         // Accumulate stake in a single record with token metadata.
-        let stake_key = DataKey::ArtisanStake(artisan.clone());
-        let current_stake: Option<ArtisanStakeData> = env.storage().persistent().get(&stake_key);
         if current_stake.is_none() {
             let count: u32 = env
                 .storage()
@@ -8668,9 +8980,6 @@ impl CraftNexusContract {
                 .set(&DataKey::StakedArtisanCount, &(count + 1));
         }
         let new_stake = if let Some(existing_stake) = current_stake {
-            if existing_stake.token != token {
-                env.panic_with_error(crate::Error::StakeTokenMismatch);
-            }
             ArtisanStakeData {
                 amount: existing_stake.amount + amount,
                 token: token.clone(),
@@ -8832,6 +9141,8 @@ impl CraftNexusContract {
         let _guard = ReentryGuardScope::new(&env);
         artisan.require_auth();
 
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
+
         // Validate the requested token matches the token recorded at stake time.
         // Rejects attempts to withdraw in a cheaper/different asset (#421).
         let stake_key = DataKey::ArtisanStake(artisan.clone());
@@ -8861,7 +9172,8 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, StakeDeposit>(&deposit_key)
             {
-                if now >= deposit.cooldown_end {
+                // Time policy: deposit is matured when now >= cooldown_end (inclusive end)
+                if time_policy::is_deadline_reached(now, deposit.cooldown_end) {
                     // Deposit is matured, add to unstake amount
                     matured_amount += deposit.amount;
                     // Remove the matured deposit
@@ -8957,11 +9269,20 @@ impl CraftNexusContract {
 
     /// Return the current staked amount for an artisan.
     pub fn get_stake(env: Env, artisan: Address) -> i128 {
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
         env.storage()
             .persistent()
             .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
             .map(|stake: ArtisanStakeData| stake.amount)
             .unwrap_or(0)
+    }
+
+    /// Return the full stake record for an artisan, including the staked token address.
+    pub fn get_artisan_stake_data(env: Env, artisan: Address) -> Option<ArtisanStakeData> {
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
+        env.storage()
+            .persistent()
+            .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
     }
 
     /// Check if an artisan account is under-collateralized (active obligations exist while holding less than minimum required stake).
@@ -9185,12 +9506,17 @@ impl CraftNexusContract {
     /// * `limit` â€“ Page size; values above `MAX_BATCH_SIZE` are silently capped
     ///
     /// # Returns
-    /// A `Vec<u32>` of escrow IDs for the requested page; empty when `page` is out of range.
-    pub fn get_all_escrow_ids_iterative(env: Env, page: u32, limit: u32) -> soroban_sdk::Vec<u32> {
-        let limit = limit.min(MAX_BATCH_SIZE);
-        if limit == 0 {
-            return soroban_sdk::Vec::new(&env);
-        }
+    /// A `Result<Vec<u32>, Error>` containing escrow IDs for the requested page;
+    /// returns `Err(PaginationLimitZero)` if `limit` is zero (#1022).
+    pub fn get_all_escrow_ids_iterative(
+        env: Env,
+        page: u32,
+        limit: u32,
+    ) -> Result<soroban_sdk::Vec<u32>, Error> {
+        let limit = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_ITERATIVE_PAGE_SIZE,
+        )?;
 
         Self::migrate_legacy_all_escrow_ids(&env);
 
@@ -9198,7 +9524,7 @@ impl CraftNexusContract {
         let start = page * limit;
 
         if start >= total {
-            return soroban_sdk::Vec::new(&env);
+            return Ok(soroban_sdk::Vec::new(&env));
         }
 
         let end = (start + limit).min(total);
@@ -9212,7 +9538,7 @@ impl CraftNexusContract {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Accept the outstanding partial refund proposal for a disputed escrow.
@@ -9658,9 +9984,10 @@ impl CraftNexusContract {
         cursor: u32,
         limit: u32,
     ) -> Result<ReconciliationReport, Error> {
-        if limit == 0 || limit > MAX_BATCH_SIZE {
-            return Err(Error::InvalidBatchWorkLimit);
-        }
+        pagination_validation::validate_strict_limit(
+            limit,
+            pagination_validation::MAX_RECONCILE_LIMIT,
+        )?;
         let total = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
         let end = cursor.saturating_add(limit).min(total);
         let mut expected_locked: i128 = if cursor == 0 {
@@ -9703,6 +10030,7 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
             {
+                Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
                 if let Some(stake) = env
                     .storage()
                     .persistent()

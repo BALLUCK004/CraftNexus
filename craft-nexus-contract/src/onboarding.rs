@@ -30,6 +30,7 @@
 //! | [`OnboardingContract::get_trust_score`] | `u32` | Decaying trust score (#939); lazy-applies decay on read. |
 //! | [`OnboardingContract::get_reputation_history`] | `Vec<ReputationHistoryEntry>` | Recent score-change log for abuse detection (#939). |
 //! | [`OnboardingContract::get_reputation_policy`] | [`ReputationPolicy`] | Decay / cooldown / anti-farming policy (#939). |
+//! | [`OnboardingContract::get_min_reputation_settlement`] | `i128` | Minimum 7-decimal normalized settlement eligible for trust. |
 //! | [`OnboardingContract::get_verification_history`] | `Vec<VerificationEntry>` | Compact entries decoded to human-readable actions. |
 //! | [`OnboardingContract::get_verification_queue`] | `Vec<Address>` | Pending manual-verification requests in FIFO order. |
 //! | [`OnboardingContract::get_config`] | [`OnboardingConfig`] | Global contract configuration. |
@@ -72,6 +73,7 @@
 //! - **Inbound:** the escrow contract — the address stored in
 //!   [`OnboardingConfig::escrow_contract`] — is the only authorized caller of
 //!   [`OnboardingContract::update_reputation`],
+//!   [`OnboardingContract::update_reputation_for_settlement`],
 //!   [`OnboardingContract::update_user_metrics`], and
 //!   [`OnboardingContract::update_active_contracts`]. When `escrow_contract` is
 //!   `None`, the `platform_admin` is used as the authorized fallback.
@@ -160,6 +162,9 @@ const DEFAULT_REPUTATION_UPDATE_COOLDOWN_SECS: u64 = 60 * 60;
 const DEFAULT_REPUTATION_FARMING_WINDOW_SECS: u64 = 24 * 60 * 60;
 /// Max successful-trade increments credited inside one farming window.
 const DEFAULT_MAX_SUCCESSFUL_PER_WINDOW: u32 = 5;
+/// Minimum completed-settlement value eligible for a trust-score increase.
+/// Values are normalized to the platform's 7-decimal base before comparison.
+const DEFAULT_MIN_REPUTATION_SETTLEMENT: i128 = 10_000_000;
 /// Bounded reputation history retained per user for abuse-pattern detection.
 const MAX_REPUTATION_HISTORY: u32 = 20;
 /// Cap decay intervals applied in one call to bound CPU (≈ 64 periods).
@@ -227,6 +232,8 @@ pub enum DataKey {
     ReputationState(Address),
     /// Global reputation decay / cooldown / anti-farming policy (#939)
     ReputationPolicy,
+    /// Minimum normalized completed-settlement value eligible for reputation.
+    MinimumReputationSettlement,
     /// Count of compact reputation history entries per user (#939)
     ReputationHistoryCount(Address),
     /// Indexed compact reputation history entry (#939)
@@ -239,8 +246,20 @@ pub enum DataKey {
     IdentityCorrelation(Bytes),
     /// Rate limit tracker for onboarding attempts per address (#940)
     RateLimitTracker(Address),
+    /// Per-account verification attempt window (#1084)
+    VerificationRateLimitTracker(Address),
+    /// Global onboarding attempt window (#1084)
+    GlobalOnboardingRateLimit,
+    /// Global verification attempt window (#1084)
+    GlobalVerificationRateLimit,
+    /// Versioned onboarding and verification rate policy (#1084)
+    AttemptRatePolicy,
     /// Suspicious activity flag record per user (#940)
     SuspiciousActivityFlag(Address),
+    /// Revision-bound Sybil review case per profile (#1086)
+    SybilReviewCase(Address),
+    /// Explicitly authorized Sybil reviewer (#1086)
+    SybilReviewer(Address),
     /// Review queue head pointer (#940)
     ReviewQueueHead,
     /// Review queue tail pointer (#940)
@@ -347,6 +366,10 @@ pub struct UserProfile {
     pub portfolio_cid: Option<Bytes>,
     /// Status of the user profile - Issue #113
     pub status: ProfileStatus,
+    /// Monotonically increasing state version — bumped on role changes,
+    /// verification transitions, deactivation, and reactivation so downstream
+    /// contracts can detect stale onboarding state.
+    pub state_version: u32,
 }
 
 /// Coherent onboarding state proof for a single privileged marketplace operation.
@@ -730,6 +753,33 @@ pub struct SuspiciousActivityFlag {
     pub delay_until: u64,
 }
 
+/// Lifecycle of a revision-bound Sybil review case (#1086).
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum SybilReviewStatus {
+    ReviewRequired = 0,
+    Approved = 1,
+    Rejected = 2,
+    Appealed = 3,
+    Expired = 4,
+}
+
+/// Review state is bound to the exact profile revision that was restricted.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SybilReviewCase {
+    pub profile_revision: u32,
+    pub reason_code: u32,
+    pub status: SybilReviewStatus,
+    pub opened_at: u64,
+    pub expires_at: u64,
+    pub decided_at: u64,
+    pub decided_by: Option<Address>,
+    pub appeal_count: u32,
+}
+
 /// Rate limit tracking entry per user address (#940).
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
@@ -738,6 +788,32 @@ pub struct RateLimitRecord {
     pub window_start: u64,
     pub count: u32,
     pub last_attempt: u64,
+}
+
+/// Versioned per-account and global attempt limits (#1084).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct AttemptRatePolicy {
+    pub revision: u32,
+    pub onboarding_window_secs: u64,
+    pub max_onboarding_per_account: u32,
+    pub max_onboarding_global: u32,
+    pub verification_window_secs: u64,
+    pub max_verification_per_account: u32,
+    pub max_verification_global: u32,
+}
+
+/// Emitted when an onboarding or verification attempt is rate-limited (#1084).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct AttemptRateLimitedEvent {
+    pub user: Address,
+    pub operation: Symbol,
+    pub scope: Symbol,
+    pub policy_revision: u32,
+    pub retry_after: u64,
 }
 
 #[contracttype]
@@ -781,6 +857,17 @@ pub struct ProfileFlaggedEvent {
 pub struct ReviewCompletedEvent {
     pub user: Address,
     pub action: Symbol,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct SybilReviewDecisionEvent {
+    pub user: Address,
+    pub reviewer: Address,
+    pub profile_revision: u32,
+    pub outcome: SybilReviewStatus,
     pub timestamp: u64,
 }
 
@@ -847,13 +934,15 @@ enum ReputationReasonCode {
     CooldownBlocked = 1,
     /// Successful delta reduced or zeroed by the farming-window cap.
     FarmingCapped = 2,
+    /// Successful delta rejected because no meaningful settlement value was supplied.
+    BelowMinimumSettlement = 3,
 }
 
 /// Public reputation history entry returned to clients (#939).
 ///
 /// Indexers and abuse-detection tooling reconstruct farming / cooldown patterns
 /// from this log. `reason` is one of `"applied"`, `"cooldown_blocked"`,
-/// `"farming_capped"`.
+/// `"farming_capped"`, `"below_minimum_settlement"`.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -945,6 +1034,18 @@ pub enum Error {
     InvalidAttestation = 27,
     /// An operation binding has already been consumed.
     AttestationReplay = 28,
+    /// Volume accumulator overflowed
+    VolumeOverflow = 26,
+    /// Attempt rate policy contains an unusable limit configuration (#1084)
+    InvalidRateLimitPolicy = 27,
+    /// Review decision does not match the current profile revision (#1086)
+    ReviewRevisionMismatch = 28,
+    /// Review window expired before a decision was submitted (#1086)
+    ReviewExpired = 29,
+    /// Requested review transition is not valid from the current state (#1086)
+    InvalidReviewTransition = 30,
+    /// Caller is not an authorized Sybil reviewer (#1086)
+    UnauthorizedReviewer = 31,
 }
 
 /// Cross-contract interface the onboarding contract uses to query the escrow
@@ -1404,6 +1505,113 @@ impl OnboardingContract {
         Self::advance_verification_head(env);
     }
 
+    fn get_attempt_rate_policy_internal(env: &Env) -> AttemptRatePolicy {
+        Self::read_persistent(env, &DataKey::AttemptRatePolicy).unwrap_or_else(|| {
+            AttemptRatePolicy {
+                revision: 1,
+                onboarding_window_secs: Self::read_persistent(
+                    env,
+                    &DataKey::OnboardingRateLimitWindow,
+                )
+                .unwrap_or(3_600),
+                max_onboarding_per_account: Self::read_persistent(
+                    env,
+                    &DataKey::MaxOnboardingAttemptsPerWindow,
+                )
+                .unwrap_or(3),
+                max_onboarding_global: 100,
+                verification_window_secs: 86_400,
+                max_verification_per_account: 3,
+                max_verification_global: 100,
+            }
+        })
+    }
+
+    fn roll_attempt_window(now: u64, window: u64, mut record: RateLimitRecord) -> RateLimitRecord {
+        if window == 0 || now >= record.window_start.saturating_add(window) {
+            record.window_start = now;
+            record.count = 0;
+        }
+        record.last_attempt = now;
+        record
+    }
+
+    /// Check both account and global capacity before writing either tracker.
+    fn consume_attempt_capacity(env: &Env, user: &Address, verification: bool) {
+        let policy = Self::get_attempt_rate_policy_internal(env);
+        let now = env.ledger().timestamp();
+        let (account_key, global_key, window, account_max, global_max, operation) =
+            if verification {
+                (
+                    DataKey::VerificationRateLimitTracker(user.clone()),
+                    DataKey::GlobalVerificationRateLimit,
+                    policy.verification_window_secs,
+                    policy.max_verification_per_account,
+                    policy.max_verification_global,
+                    Symbol::new(env, "verification"),
+                )
+            } else {
+                (
+                    DataKey::RateLimitTracker(user.clone()),
+                    DataKey::GlobalOnboardingRateLimit,
+                    policy.onboarding_window_secs,
+                    policy.max_onboarding_per_account,
+                    policy.max_onboarding_global,
+                    Symbol::new(env, "onboarding"),
+                )
+            };
+
+        let account = Self::roll_attempt_window(
+            now,
+            window,
+            Self::read_persistent(env, &account_key).unwrap_or(RateLimitRecord {
+                window_start: now,
+                count: 0,
+                last_attempt: now,
+            }),
+        );
+        let global = Self::roll_attempt_window(
+            now,
+            window,
+            Self::read_persistent(env, &global_key).unwrap_or(RateLimitRecord {
+                window_start: now,
+                count: 0,
+                last_attempt: now,
+            }),
+        );
+
+        let limited_scope = if account_max > 0 && account.count >= account_max {
+            Some((Symbol::new(env, "account"), account.window_start))
+        } else if global_max > 0 && global.count >= global_max {
+            Some((Symbol::new(env, "global"), global.window_start))
+        } else {
+            None
+        };
+
+        if let Some((scope, window_start)) = limited_scope {
+            env.events().publish(
+                (Symbol::new(env, "AttemptRateLimited"), operation.clone()),
+                AttemptRateLimitedEvent {
+                    user: user.clone(),
+                    operation,
+                    scope,
+                    policy_revision: policy.revision,
+                    retry_after: window_start.saturating_add(window),
+                },
+            );
+            env.panic_with_error(Error::RateLimitExceeded);
+        }
+
+        let mut next_account = account;
+        next_account.count = next_account.count.saturating_add(1);
+        let mut next_global = global;
+        next_global.count = next_global.count.saturating_add(1);
+        env.storage().persistent().set(&account_key, &next_account);
+        Self::extend_persistent(env, &account_key);
+        env.storage().persistent().set(&global_key, &next_global);
+        Self::extend_persistent(env, &global_key);
+    }
+
     fn enqueue_review_request(env: &Env, user: &Address) {
         let tail = Self::get_queue_pointer(env, &DataKey::ReviewQueueTail);
         let queue_index_key = DataKey::ReviewQueueIndex(tail);
@@ -1710,6 +1918,26 @@ impl OnboardingContract {
             .unwrap_or_else(Self::default_reputation_policy)
     }
 
+    fn get_minimum_reputation_settlement_internal(env: &Env) -> i128 {
+        Self::read_persistent(env, &DataKey::MinimumReputationSettlement)
+            .unwrap_or(DEFAULT_MIN_REPUTATION_SETTLEMENT)
+    }
+
+    /// Convert a token-native amount to the platform's 7-decimal base.
+    fn normalize_token_amount(env: &Env, amount: i128, token_address: &Address) -> i128 {
+        let token_client = token::Client::new(env, token_address);
+        let token_decimals = token_client.decimals();
+        let base_decimals = 7u32;
+
+        if token_decimals < base_decimals {
+            amount.saturating_mul(10i128.pow(base_decimals - token_decimals))
+        } else if token_decimals > base_decimals {
+            amount / 10i128.pow(token_decimals - base_decimals)
+        } else {
+            amount
+        }
+    }
+
     /// Load or initialize per-user reputation state.
     fn get_or_init_reputation_state(env: &Env, user: &Address) -> ReputationState {
         let key = DataKey::ReputationState(user.clone());
@@ -1847,6 +2075,9 @@ impl OnboardingContract {
             ReputationReasonCode::Applied => Symbol::new(env, "applied"),
             ReputationReasonCode::CooldownBlocked => Symbol::new(env, "cooldown_blocked"),
             ReputationReasonCode::FarmingCapped => Symbol::new(env, "farming_capped"),
+            ReputationReasonCode::BelowMinimumSettlement => {
+                Symbol::new(env, "below_minimum_settlement")
+            }
         }
     }
 
@@ -1953,7 +2184,9 @@ impl OnboardingContract {
         cid_bytes
     }
 
-    fn stored_to_public(stored: StoredUserProfile, portfolio_cid: Option<Bytes>) -> UserProfile {
+    fn stored_to_public(env: &Env, stored: StoredUserProfile, portfolio_cid: Option<Bytes>) -> UserProfile {
+        let state_version = Self::read_persistent(env, &DataKey::UserStateVersion(stored.address.clone()))
+            .unwrap_or(1);
         UserProfile {
             version: stored.version,
             address: stored.address,
@@ -1965,6 +2198,7 @@ impl OnboardingContract {
             disputed_trades: stored.disputed_trades,
             portfolio_cid,
             status: stored.status,
+            state_version,
         }
     }
 
@@ -2071,6 +2305,31 @@ impl OnboardingContract {
         env.crypto().sha256(&payload)
     }
 
+    /// Ensure the reverse username index points at the canonical account.
+    /// A missing index is a recoverable partial-onboarding state; an index
+    /// owned by another account is a real uniqueness conflict (#1085).
+    fn ensure_username_claim(env: &Env, normalized: &String, user: &Address) {
+        let key = DataKey::Username(normalized.clone());
+        match Self::read_persistent::<_, Address>(env, &key) {
+            Some(owner) if owner != *user => env.panic_with_error(Error::UsernameTaken),
+            Some(_) => Self::extend_persistent(env, &key),
+            None => {
+                env.storage().persistent().set(&key, user);
+                Self::extend_persistent(env, &key);
+            }
+        }
+    }
+
+    /// Repair secondary state for an existing account-keyed canonical profile.
+    fn repair_onboarding_state(env: &Env, normalized: &String, user: &Address) {
+        Self::ensure_username_claim(env, normalized, user);
+        let version_key = DataKey::UserStateVersion(user.clone());
+        if !env.storage().persistent().has(&version_key) {
+            env.storage().persistent().set(&version_key, &1u32);
+        }
+        Self::extend_persistent(env, &version_key);
+    }
+
     fn migrate_embedded_versioned_profile(
         env: &Env,
         user: &Address,
@@ -2092,7 +2351,8 @@ impl OnboardingContract {
             status: profile.status,
         };
         Self::persist_stored_user_profile(env, user, &stored);
-        Self::ensure_state_revision(env, user);
+        env.storage().persistent().set(&DataKey::UserStateVersion(user.clone()), &1u32);
+        Self::extend_persistent(env, &DataKey::UserStateVersion(user.clone()));
         (stored, true)
     }
 
@@ -2163,7 +2423,7 @@ impl OnboardingContract {
     fn try_get_user_profile(env: &Env, user: Address) -> Option<UserProfile> {
         let (stored, _) = Self::try_get_stored_user_profile(env, user.clone())?;
         let portfolio_cid = Self::read_portfolio_cid(env, &user);
-        Some(Self::stored_to_public(stored, portfolio_cid))
+        Some(Self::stored_to_public(env, stored, portfolio_cid))
     }
 
     fn get_user_profile(env: &Env, user: Address) -> UserProfile {
@@ -2171,20 +2431,31 @@ impl OnboardingContract {
             .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound))
     }
 
+    fn bump_state_version(env: &Env, user: &Address) -> u32 {
+        let key = DataKey::UserStateVersion(user.clone());
+        let current: u32 = Self::read_persistent(env, &key).unwrap_or(1u32);
+        let next: u32 = current.saturating_add(1);
+        env.storage().persistent().set(&key, &next);
+        Self::extend_persistent(env, &key);
+        next
+    }
+
     /// Assert that `user` is onboarded and their profile is currently active.
     ///
-    /// Panics with [`Error::UserNotFound`] when no profile exists, or with
-    /// [`Error::ProfileDeactivated`] when the profile's status is
-    /// [`ProfileStatus::Deactivated`]. Used by state-mutating endpoints that
-    /// must not operate on deactivated accounts (e.g. `update_user_role`,
+    /// Panics with the status-specific error when the profile is deactivated,
+    /// under review, or flagged. Used by state-mutating endpoints that must not
+    /// operate on restricted accounts (e.g. `update_user_role` and
     /// `deactivate_profile`).
     ///
     /// # Returns
     /// The loaded [`UserProfile`] so callers do not have to fetch it again.
     fn assert_user_onboarded_and_active(env: &Env, user: Address) -> UserProfile {
         let profile = Self::get_user_profile(env, user);
-        if profile.status == ProfileStatus::Deactivated {
-            env.panic_with_error(Error::ProfileDeactivated);
+        match profile.status {
+            ProfileStatus::Deactivated => env.panic_with_error(Error::ProfileDeactivated),
+            ProfileStatus::UnderReview => env.panic_with_error(Error::ProfileUnderReview),
+            ProfileStatus::Flagged => env.panic_with_error(Error::ProfileFlagged),
+            ProfileStatus::Active => {}
         }
         profile
     }
@@ -2462,6 +2733,7 @@ impl OnboardingContract {
             disputed_trades: 0,
             portfolio_cid: None,
             status: ProfileStatus::Active,
+            state_version: 1,
         };
 
         Self::persist_public_user_profile(&env, &admin, &admin_profile);
@@ -2611,44 +2883,39 @@ impl OnboardingContract {
             }
         }
 
-        // [ANTI-SYBIL] Rate Limiting per address
-        let now = env.ledger().timestamp();
-        let rate_key = DataKey::RateLimitTracker(user.clone());
-        let mut rate_record: RateLimitRecord =
-            Self::read_persistent(&env, &rate_key).unwrap_or(RateLimitRecord {
-                window_start: now,
-                count: 0,
-                last_attempt: now,
-            });
+        let normalized = normalize_username(&env, &username);
+        let username_len = core::cmp::min(normalized.len() as usize, 32);
+        let mut user_buf = [0u8; 32];
+        normalized.copy_into_slice(&mut user_buf[..username_len]);
+        let s = core::str::from_utf8(&user_buf[..username_len]).unwrap();
+        let optimized_username = Symbol::new(&env, s);
 
-        let window =
-            Self::read_persistent(&env, &DataKey::OnboardingRateLimitWindow).unwrap_or(3600u64);
-        let max_attempts =
-            Self::read_persistent(&env, &DataKey::MaxOnboardingAttemptsPerWindow).unwrap_or(3u32);
-
-        if window > 0 {
-            if now < rate_record.window_start + window {
-                if rate_record.count >= max_attempts {
-                    env.events().publish(
-                        (Symbol::new(&env, "SybilPatternDetected"),),
-                        SybilPatternDetectedEvent {
-                            user: user.clone(),
-                            reason: Symbol::new(&env, "RateLimitExceeded"),
-                            timestamp: now,
-                        },
-                    );
-                    Self::emit_onboard_failed_and_panic(&env, &user, Error::RateLimitExceeded);
-                }
-                rate_record.count += 1;
-                rate_record.last_attempt = now;
-            } else {
-                rate_record.window_start = now;
-                rate_record.count = 1;
-                rate_record.last_attempt = now;
-            }
-            env.storage().persistent().set(&rate_key, &rate_record);
-            Self::extend_persistent(&env, &rate_key);
+        if (username_len as u32) < config.min_username_length {
+            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooShort);
         }
+        if (username_len as u32) > config.max_username_length {
+            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooLong);
+        }
+
+        // The account-keyed profile is canonical. An exact retry returns it and
+        // repairs any missing secondary index without incrementing counters or
+        // repeating identity/rate-limit side effects (#1085).
+        if let Some((existing, _)) = Self::try_get_stored_user_profile(&env, user.clone()) {
+            if existing.username != optimized_username || existing.role != role {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::AlreadyOnboarded);
+            }
+            Self::repair_onboarding_state(&env, &normalized, &user);
+            return Self::stored_to_public(
+                &env,
+                existing,
+                Self::read_portfolio_cid(&env, &user),
+            );
+        }
+
+        // Check per-account and global capacity only after an idempotent retry
+        // has been ruled out, and before identity/profile writes (#1084, #1085).
+        let now = env.ledger().timestamp();
+        Self::consume_attempt_capacity(&env, &user, false);
 
         // [ANTI-SYBIL] Identity Correlation Check
         if !identity_hash.is_empty() {
@@ -2689,32 +2956,15 @@ impl OnboardingContract {
             }
         }
 
-        let normalized = normalize_username(&env, &username);
-        let username_len = core::cmp::min(normalized.len() as usize, 32);
-        let mut user_buf = [0u8; 32];
-        normalized.copy_into_slice(&mut user_buf[..username_len]);
-        let s = core::str::from_utf8(&user_buf[..username_len]).unwrap();
-        let optimized_username = Symbol::new(&env, s);
-
-        if (username_len as u32) < config.min_username_length {
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooShort);
-        }
-        if (username_len as u32) > config.max_username_length {
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTooLong);
-        }
-
-        let existing = Self::try_get_stored_user_profile(&env, user.clone());
-        if existing.is_some() {
-            Self::extend_persistent(&env, &DataKey::UserProfile(user.clone()));
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::AlreadyOnboarded);
-        }
-
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Username(normalized.clone()))
-        {
-            Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTaken);
+        if let Some(owner) = Self::read_persistent::<_, Address>(
+            &env,
+            &DataKey::Username(normalized.clone()),
+        ) {
+            // A same-account reservation with no profile is a recoverable
+            // interrupted write; another owner remains a hard conflict.
+            if owner != user {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::UsernameTaken);
+            }
         }
 
         let profile = UserProfile {
@@ -2728,15 +2978,13 @@ impl OnboardingContract {
             disputed_trades: 0,
             portfolio_cid: None,
             status: ProfileStatus::Active,
+            state_version: 1,
         };
 
         Self::persist_public_user_profile(&env, &user, &profile);
         Self::update_active_user_count(&env, 1);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Username(normalized.clone()), &user);
-        Self::extend_persistent(&env, &DataKey::Username(normalized.clone()));
+        Self::repair_onboarding_state(&env, &normalized, &user);
 
         // Emitted after all storage writes complete, so subscribers observing this
         // event can safely query `get_user` and `get_user_by_username` immediately.
@@ -2751,9 +2999,8 @@ impl OnboardingContract {
         //   - Trigger downstream workflows (welcome emails, dashboard provisioning, etc.)
         //     only after the event is confirmed in a closed ledger to avoid acting on
         //     failed transactions.
-        //   - This event is emitted exactly once per address.  A second call to
-        //     `onboard_user` with the same address panics with `AlreadyOnboarded`
-        //     and produces no event.
+        //   - This event is emitted exactly once per address. An identical retry
+        //     returns the canonical profile without emitting another event.
         env.events().publish(
             (Symbol::new(&env, "UserOnboarded"),),
             UserOnboardedEvent {
@@ -2765,6 +3012,35 @@ impl OnboardingContract {
         Self::increment_persistent_u32(&env, &DataKey::GlobalOnboardCount);
 
         profile
+    }
+
+    /// Repair secondary onboarding state from the account-keyed canonical
+    /// profile without creating or replacing a profile (#1085).
+    pub fn recover_onboarding_profile(env: Env, user: Address, username: String) -> UserProfile {
+        user.require_auth();
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        let normalized = normalize_username(&env, &username);
+        let username_len = core::cmp::min(normalized.len() as usize, 32);
+        let mut user_buf = [0u8; 32];
+        normalized.copy_into_slice(&mut user_buf[..username_len]);
+        let canonical_username = Symbol::new(
+            &env,
+            core::str::from_utf8(&user_buf[..username_len]).unwrap(),
+        );
+        let (stored, _) = Self::try_get_stored_user_profile(&env, user.clone())
+            .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound));
+        if stored.username != canonical_username {
+            env.panic_with_error(Error::AlreadyOnboarded);
+        }
+
+        Self::repair_onboarding_state(&env, &normalized, &user);
+        Self::stored_to_public(&env, stored, Self::read_portfolio_cid(&env, &user))
     }
 
     /// Read-only accessor for a user's profile, keyed by their Stellar
@@ -3146,6 +3422,52 @@ impl OnboardingContract {
         }
     }
 
+    /// Return true if the user's profile exists and is currently active.
+    ///
+    /// Returns `false` for unknown addresses or any inactive status
+    /// (Deactivated, UnderReview, Flagged).
+    pub fn is_profile_active(env: Env, user: Address) -> bool {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.status == ProfileStatus::Active
+        } else {
+            false
+        }
+    }
+
+    /// Return the schema version stored on a user's profile.
+    ///
+    /// Returns `0` if the user has no profile.
+    pub fn get_user_profile_version(env: Env, user: Address) -> u32 {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.version
+        } else {
+            0
+        }
+    }
+
+    /// Return the monotonically increasing state version for a user's profile.
+    ///
+    /// Returns `0` if the user has no profile. Missing `UserStateVersion`
+    /// keys default to `1` on read.
+    pub fn get_user_state_version(env: Env, user: Address) -> u32 {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.state_version
+        } else {
+            0
+        }
+    }
+
+    /// Return true if the user has passed verification (manual or auto).
+    ///
+    /// Returns `false` for unknown addresses.
+    pub fn is_user_verified(env: Env, user: Address) -> bool {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.is_verified
+        } else {
+            false
+        }
+    }
+
     /// Assign or update the moderator role for a user (admin only).
     ///
     /// # Security (#117)
@@ -3246,6 +3568,8 @@ impl OnboardingContract {
             (user.clone(), old_role, new_role),
         );
 
+        Self::bump_state_version(&env, &user);
+
         profile
     }
 
@@ -3325,6 +3649,7 @@ impl OnboardingContract {
         // Update profile state
         profile.status = ProfileStatus::Deactivated;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
         Self::update_active_user_count(&env, -1);
 
         // Issue #524 — event payload now carries the user's role at
@@ -3402,6 +3727,7 @@ impl OnboardingContract {
 
         profile.status = ProfileStatus::Active;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
         Self::update_active_user_count(&env, 1);
 
         env.events().publish(
@@ -3466,6 +3792,7 @@ impl OnboardingContract {
 
         // Store updated profile
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
 
         // Emit event
         env.events()
@@ -3777,19 +4104,7 @@ impl OnboardingContract {
             .saturating_add(escrow_count_delta);
 
         // Normalize volume to 7 decimals (base decimal for auto-verification thresholds)
-        let token_client = token::Client::new(&env, &token_address);
-        let token_decimals = token_client.decimals();
-        let base_decimals = 7u32;
-
-        let normalized_delta = if token_decimals < base_decimals {
-            let diff = base_decimals - token_decimals;
-            volume_delta.saturating_mul(10i128.pow(diff))
-        } else if token_decimals > base_decimals {
-            let diff = token_decimals - base_decimals;
-            volume_delta / 10i128.pow(diff)
-        } else {
-            volume_delta
-        };
+        let normalized_delta = Self::normalize_token_amount(&env, volume_delta, &token_address);
 
         metrics.total_volume = metrics
             .total_volume
@@ -3925,6 +4240,7 @@ impl OnboardingContract {
         {
             profile.is_verified = true;
             Self::persist_public_user_profile(env, address, &profile);
+            Self::bump_state_version(env, address);
 
             // auto-verification triggered — emit AutoVerifiedEvent (#713)
             env.events().publish(
@@ -4048,6 +4364,10 @@ impl OnboardingContract {
             return;
         }
 
+        // Capacity is consumed only for a new queue entry, so duplicate pending
+        // requests remain idempotent and never create duplicate records (#1084).
+        Self::consume_attempt_capacity(&env, &user, true);
+
         let now = env.ledger().timestamp();
         let last_attempt_key = DataKey::VerificationLastAttempt(user.clone());
         let cooldown =
@@ -4147,6 +4467,7 @@ impl OnboardingContract {
 
         profile.is_verified = approve;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
 
         Self::clear_verification_request(&env, &user);
 
@@ -4370,7 +4691,69 @@ impl OnboardingContract {
             None => config.platform_admin.require_auth(),
         }
 
-        let mut profile = match Self::try_get_user_profile(&env, address.clone()) {
+        Self::apply_reputation_update(&env, &address, successful_delta, disputed_delta, None);
+    }
+
+    /// Apply reputation for a completed settlement after checking its value.
+    ///
+    /// Successful credit is eligible only when `settlement_amount`, normalized
+    /// to 7 decimals using `token_address`, meets the configured minimum.
+    /// Disputes always apply. Rejected low-value attempts are appended to the
+    /// score history but do not consume cooldown or farming-window capacity.
+    pub fn update_reputation_for_settlement(
+        env: Env,
+        address: Address,
+        successful_delta: u32,
+        disputed_delta: u32,
+        settlement_amount: i128,
+        token_address: Address,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        match config.escrow_contract {
+            Some(ref escrow_addr) => escrow_addr.require_auth(),
+            None => config.platform_admin.require_auth(),
+        }
+
+        if successful_delta == 0 && disputed_delta == 0 {
+            return;
+        }
+
+        let normalized_amount = if successful_delta > 0 && settlement_amount > 0 {
+            Self::normalize_token_amount(&env, settlement_amount, &token_address)
+        } else {
+            0
+        };
+        let below_minimum = successful_delta > 0
+            && (settlement_amount <= 0
+                || normalized_amount < Self::get_minimum_reputation_settlement_internal(&env));
+
+        Self::apply_reputation_update(
+            &env,
+            &address,
+            successful_delta,
+            disputed_delta,
+            if below_minimum {
+                Some(ReputationReasonCode::BelowMinimumSettlement)
+            } else {
+                None
+            },
+        );
+    }
+
+    fn apply_reputation_update(
+        env: &Env,
+        address: &Address,
+        successful_delta: u32,
+        disputed_delta: u32,
+        successful_rejection: Option<ReputationReasonCode>,
+    ) {
+        let mut profile = match Self::try_get_user_profile(env, address.clone()) {
             Some(p) => p,
             None => return, // User not onboarded; skip silently
         };
@@ -4379,12 +4762,14 @@ impl OnboardingContract {
             return;
         }
 
-        let policy = Self::get_reputation_policy_internal(&env);
-        let mut state = Self::get_or_init_reputation_state(&env, &address);
-        Self::apply_reputation_decay(&env, &mut state, &policy);
+        let policy = Self::get_reputation_policy_internal(env);
+        let mut state = Self::get_or_init_reputation_state(env, address);
+        Self::apply_reputation_decay(env, &mut state, &policy);
 
-        let (successful_applied, success_reason) =
-            Self::credit_successful_delta(&env, &mut state, &policy, successful_delta);
+        let (successful_applied, success_reason) = match successful_rejection {
+            Some(reason) => (0, reason),
+            None => Self::credit_successful_delta(env, &mut state, &policy, successful_delta),
+        };
         // Adverse outcomes always apply — cooldown/farming must not shield bad actors.
         let disputed_applied = disputed_delta;
 
@@ -4408,11 +4793,11 @@ impl OnboardingContract {
                 .saturating_add(successful_applied);
         }
 
-        Self::persist_public_user_profile(&env, &address, &profile);
-        Self::persist_reputation_state(&env, &address, &state);
+        Self::persist_public_user_profile(env, address, &profile);
+        Self::persist_reputation_state(env, address, &state);
         Self::append_reputation_history(
-            &env,
-            &address,
+            env,
+            address,
             successful_delta,
             disputed_delta,
             successful_applied,
@@ -4531,6 +4916,30 @@ impl OnboardingContract {
     /// Read the active reputation decay / anti-farming policy (#939).
     pub fn get_reputation_policy(env: Env) -> ReputationPolicy {
         Self::get_reputation_policy_internal(&env)
+    }
+
+    /// Read the minimum 7-decimal normalized settlement value for reputation.
+    pub fn get_min_reputation_settlement(env: Env) -> i128 {
+        Self::get_minimum_reputation_settlement_internal(&env)
+    }
+
+    /// Set the minimum completed-settlement value eligible for reputation.
+    pub fn set_min_reputation_settlement(env: Env, minimum_amount: i128) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        if minimum_amount < 0 {
+            env.panic_with_error(Error::InvalidReputationPolicy);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinimumReputationSettlement, &minimum_amount);
+        Self::extend_persistent(&env, &DataKey::MinimumReputationSettlement);
     }
 
     /// Set the reputation decay / anti-farming policy (admin only, #939).
@@ -4710,6 +5119,7 @@ impl OnboardingContract {
 
         // Store updated profile
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
 
         // Record timestamp of username change
         env.storage().persistent().set(
@@ -5071,6 +5481,55 @@ impl OnboardingContract {
         Self::read_persistent(&env, &DataKey::VerificationCooldown).unwrap_or(86400)
     }
 
+    /// Read the active versioned onboarding/verification attempt policy (#1084).
+    pub fn get_attempt_rate_policy(env: Env) -> AttemptRatePolicy {
+        Self::get_attempt_rate_policy_internal(&env)
+    }
+
+    /// Replace attempt limits and advance the policy revision (admin only, #1084).
+    pub fn set_attempt_rate_policy(
+        env: Env,
+        onboarding_window_secs: u64,
+        max_onboarding_per_account: u32,
+        max_onboarding_global: u32,
+        verification_window_secs: u64,
+        max_verification_per_account: u32,
+        max_verification_global: u32,
+    ) -> AttemptRatePolicy {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+
+        if (onboarding_window_secs == 0
+            && (max_onboarding_per_account > 0 || max_onboarding_global > 0))
+            || (verification_window_secs == 0
+                && (max_verification_per_account > 0 || max_verification_global > 0))
+        {
+            env.panic_with_error(Error::InvalidRateLimitPolicy);
+        }
+
+        let revision = Self::get_attempt_rate_policy_internal(&env)
+            .revision
+            .saturating_add(1);
+        let policy = AttemptRatePolicy {
+            revision,
+            onboarding_window_secs,
+            max_onboarding_per_account,
+            max_onboarding_global,
+            verification_window_secs,
+            max_verification_per_account,
+            max_verification_global,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AttemptRatePolicy, &policy);
+        Self::extend_persistent(&env, &DataKey::AttemptRatePolicy);
+        policy
+    }
+
     /// Read whether Proof-of-Humanity is required for auto/manual verification (#940).
     pub fn is_poh_required_for_auto_verify(env: Env) -> bool {
         Self::read_persistent(&env, &DataKey::PohRequiredForAutoVerify).unwrap_or(false)
@@ -5214,6 +5673,108 @@ impl OnboardingContract {
         }
     }
 
+    fn require_sybil_reviewer(env: &Env, config: &OnboardingConfig, reviewer: &Address) {
+        reviewer.require_auth();
+        let authorized = *reviewer == config.platform_admin
+            || Self::read_persistent::<_, bool>(env, &DataKey::SybilReviewer(reviewer.clone()))
+                .unwrap_or(false);
+        if !authorized {
+            env.panic_with_error(Error::UnauthorizedReviewer);
+        }
+    }
+
+    fn apply_sybil_review_decision(
+        env: &Env,
+        reviewer: &Address,
+        user: &Address,
+        expected_profile_revision: u32,
+        approve: bool,
+    ) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(env, &DataKey::Config);
+        Self::require_sybil_reviewer(env, &config, reviewer);
+
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::ReviewRequired
+            && case.status != SybilReviewStatus::Appealed
+        {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+
+        let mut profile = Self::get_user_profile(env, user.clone());
+        if case.profile_revision != expected_profile_revision
+            || profile.state_version != expected_profile_revision
+        {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+        let now = env.ledger().timestamp();
+        if now >= case.expires_at {
+            env.panic_with_error(Error::ReviewExpired);
+        }
+
+        let (outcome, action) = if approve {
+            profile.status = ProfileStatus::Active;
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SuspiciousActivityFlag(user.clone()));
+            (SybilReviewStatus::Approved, "approved")
+        } else {
+            profile.status = ProfileStatus::Flagged;
+            (SybilReviewStatus::Rejected, "rejected")
+        };
+        Self::persist_public_user_profile(env, user, &profile);
+        Self::bump_state_version(env, user);
+
+        case.status = outcome;
+        case.decided_at = now;
+        case.decided_by = Some(reviewer.clone());
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(env, &case_key);
+        Self::advance_review_head(env);
+
+        env.events().publish(
+            (Symbol::new(env, "SybilReviewDecision"),),
+            SybilReviewDecisionEvent {
+                user: user.clone(),
+                reviewer: reviewer.clone(),
+                profile_revision: expected_profile_revision,
+                outcome,
+                timestamp: now,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(env, "ReviewCompleted"),),
+            ReviewCompletedEvent {
+                user: user.clone(),
+                action: Symbol::new(env, action),
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Grant or revoke authority to decide Sybil review cases (#1086).
+    pub fn set_sybil_reviewer(env: Env, reviewer: Address, authorized: bool) {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
+        let key = DataKey::SybilReviewer(reviewer);
+        if authorized {
+            env.storage().persistent().set(&key, &true);
+            Self::extend_persistent(&env, &key);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+    }
+
     /// Flag a user profile for suspicious anti-Sybil behavior and enqueue for review (admin only) (#940).
     pub fn flag_suspicious_profile(
         env: Env,
@@ -5233,6 +5794,7 @@ impl OnboardingContract {
         let mut profile = Self::get_user_profile(&env, target_user.clone());
         profile.status = ProfileStatus::UnderReview;
         Self::persist_public_user_profile(&env, &target_user, &profile);
+        let profile_revision = Self::bump_state_version(&env, &target_user);
 
         let now = env.ledger().timestamp();
         let flag = SuspiciousActivityFlag {
@@ -5245,6 +5807,20 @@ impl OnboardingContract {
         let flag_key = DataKey::SuspiciousActivityFlag(target_user.clone());
         env.storage().persistent().set(&flag_key, &flag);
         Self::extend_persistent(&env, &flag_key);
+
+        let case_key = DataKey::SybilReviewCase(target_user.clone());
+        let review_case = SybilReviewCase {
+            profile_revision,
+            reason_code,
+            status: SybilReviewStatus::ReviewRequired,
+            opened_at: now,
+            expires_at: now.saturating_add(delay_seconds),
+            decided_at: 0,
+            decided_by: None,
+            appeal_count: 0,
+        };
+        env.storage().persistent().set(&case_key, &review_case);
+        Self::extend_persistent(&env, &case_key);
 
         Self::enqueue_review_request(&env, &target_user);
 
@@ -5269,6 +5845,11 @@ impl OnboardingContract {
     /// Read the active suspicious activity flag for a user (#940).
     pub fn get_suspicious_flag(env: Env, user: Address) -> Option<SuspiciousActivityFlag> {
         Self::read_persistent(&env, &DataKey::SuspiciousActivityFlag(user))
+    }
+
+    /// Read the revision-bound Sybil review case for a profile (#1086).
+    pub fn get_sybil_review(env: Env, user: Address) -> Option<SybilReviewCase> {
+        Self::read_persistent(&env, &DataKey::SybilReviewCase(user))
     }
 
     /// Retrieve queue of addresses currently under administrative anti-Sybil review (admin only) (#940).
@@ -5302,40 +5883,100 @@ impl OnboardingContract {
         queue
     }
 
-    /// Process an anti-Sybil review decision for a user under review (admin only) (#940).
+    /// Submit a reviewer-authorized decision bound to a profile revision (#1086).
+    pub fn decide_sybil_review(
+        env: Env,
+        reviewer: Address,
+        user: Address,
+        expected_profile_revision: u32,
+        approve: bool,
+    ) {
+        Self::apply_sybil_review_decision(
+            &env,
+            &reviewer,
+            &user,
+            expected_profile_revision,
+            approve,
+        );
+    }
+
+    /// Appeal a rejected or expired review and open a new revision-bound window (#1086).
+    pub fn appeal_sybil_review(env: Env, user: Address, expected_profile_revision: u32) {
+        user.require_auth();
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(&env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::Rejected && case.status != SybilReviewStatus::Expired {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        let mut profile = Self::get_user_profile(&env, user.clone());
+        if profile.state_version != expected_profile_revision {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+
+        let duration = case.expires_at.saturating_sub(case.opened_at).max(1);
+        let now = env.ledger().timestamp();
+        profile.status = ProfileStatus::UnderReview;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        let next_revision = Self::bump_state_version(&env, &user);
+        case.profile_revision = next_revision;
+        case.status = SybilReviewStatus::Appealed;
+        case.opened_at = now;
+        case.expires_at = now.saturating_add(duration);
+        case.decided_at = 0;
+        case.decided_by = None;
+        case.appeal_count = case.appeal_count.saturating_add(1);
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(&env, &case_key);
+        Self::enqueue_review_request(&env, &user);
+    }
+
+    /// Close an elapsed review window while keeping the account restricted (#1086).
+    pub fn expire_sybil_review(env: Env, user: Address, expected_profile_revision: u32) {
+        user.require_auth();
+        let case_key = DataKey::SybilReviewCase(user.clone());
+        let mut case: SybilReviewCase = Self::read_persistent(&env, &case_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        if case.status != SybilReviewStatus::ReviewRequired
+            && case.status != SybilReviewStatus::Appealed
+        {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        let mut profile = Self::get_user_profile(&env, user.clone());
+        if case.profile_revision != expected_profile_revision
+            || profile.state_version != expected_profile_revision
+        {
+            env.panic_with_error(Error::ReviewRevisionMismatch);
+        }
+        if env.ledger().timestamp() < case.expires_at {
+            env.panic_with_error(Error::InvalidReviewTransition);
+        }
+        profile.status = ProfileStatus::Flagged;
+        Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
+        case.status = SybilReviewStatus::Expired;
+        case.decided_at = env.ledger().timestamp();
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent(&env, &case_key);
+        Self::advance_review_head(&env);
+    }
+
+    /// Backward-compatible admin decision entrypoint (#940, #1086).
     pub fn process_review(env: Env, user: Address, approve: bool) {
         let config: OnboardingConfig = env
             .storage()
             .persistent()
             .get(&DataKey::Config)
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
-        Self::extend_persistent(&env, &DataKey::Config);
-
-        config.platform_admin.require_auth();
-
-        let mut profile = Self::get_user_profile(&env, user.clone());
-
-        let action_str = if approve {
-            profile.status = ProfileStatus::Active;
-            env.storage()
-                .persistent()
-                .remove(&DataKey::SuspiciousActivityFlag(user.clone()));
-            "approved"
-        } else {
-            profile.status = ProfileStatus::Flagged;
-            "flagged"
-        };
-
-        Self::persist_public_user_profile(&env, &user, &profile);
-
-        let now = env.ledger().timestamp();
-        env.events().publish(
-            (Symbol::new(&env, "ReviewCompleted"),),
-            ReviewCompletedEvent {
-                user,
-                action: Symbol::new(&env, action_str),
-                timestamp: now,
-            },
+        let review: SybilReviewCase =
+            Self::read_persistent(&env, &DataKey::SybilReviewCase(user.clone()))
+                .unwrap_or_else(|| env.panic_with_error(Error::InvalidReviewTransition));
+        Self::apply_sybil_review_decision(
+            &env,
+            &config.platform_admin,
+            &user,
+            review.profile_revision,
+            approve,
         );
     }
 }
