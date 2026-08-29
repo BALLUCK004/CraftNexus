@@ -10325,6 +10325,181 @@ impl CraftNexusContract {
             .get(&DataKey::ReconciliationReport(token))
     }
 
+    /// Pure read-only query to compute a reconciliation report on demand.
+    ///
+    /// This function queries the current token balance and compares it against:
+    /// - Sum of all active escrows (locked funds)
+    /// - Sum of all staked amounts (staked funds)
+    /// - Tracked totals from incremental counters
+    /// - Collected platform fees
+    ///
+    /// No storage writes occur. Results are computed fresh each call.
+    ///
+    /// # Pagination
+    /// Reports on large escrow sets are paginated. Pass `page=0` and `page_size=50`
+    /// to start. If `complete=false`, call again with `next_cursor` as the new page.
+    ///
+    /// # Arguments
+    /// * `token` - Token contract address to reconcile
+    /// * `page` - Starting escrow index (0-based)
+    /// * `page_size` - Max escrows to scan per call (capped at MAX_PAGE_SIZE=100)
+    ///
+    /// # Returns
+    /// A `ReconciliationReport` with:
+    /// - `balance`: Current canonical token balance
+    /// - `expected_locked`: Sum of active escrow amounts from storage scan
+    /// - `expected_staked`: Sum of all staked amounts
+    /// - `tracked_locked`: Incremental counter (may diverge if bug exists)
+    /// - `tracked_staked`: Incremental counter (may diverge if bug exists)
+    /// - `scanned_escrows`: Number of escrows read in this call
+    /// - `next_cursor`: Cursor for next page (if `complete=false`)
+    /// - `complete`: True if all escrows have been scanned
+    /// - `unresolved`: True if any discrepancy found (only set when `complete=true`)
+    pub fn query_reconciliation_report(
+        env: Env,
+        token: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Result<ReconciliationReport, Error> {
+        // Validate pagination inputs
+        let page_size = pagination_validation::validate_limit(
+            page_size,
+            pagination_validation::MAX_PAGE_SIZE,
+        )?;
+
+        // Read the canonical token balance
+        let balance = token::Client::new(&env, &token)
+            .balance(&env.current_contract_address());
+
+        // Get total escrow count
+        let total_escrows: u32 = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
+
+        // Calculate page bounds
+        let end = page.saturating_add(page_size).min(total_escrows);
+
+        // Sum active escrow amounts for this page
+        let mut expected_locked = 0i128;
+        let mut scanned = 0u32;
+
+        for index in page..end {
+            let Some(order_id) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::GlobalEscrowIdIndexed(index))
+            else {
+                continue;
+            };
+
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u32), Escrow>(&(ESCROW, order_id))
+            {
+                if escrow.token == token
+                    && matches!(
+                        escrow.status,
+                        EscrowStatus::Active
+                            | EscrowStatus::Disputed
+                            | EscrowStatus::ReleasePending
+                            | EscrowStatus::RefundPending
+                            | EscrowStatus::DisputePending
+                            | EscrowStatus::SettlementPending
+                    )
+                {
+                    expected_locked = expected_locked.saturating_add(escrow.amount);
+                }
+                scanned = scanned.saturating_add(1);
+            }
+        }
+
+        // Sum all recurring escrow amounts (only on first page)
+        if page == 0 {
+            let recurring_count: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RecurringEscrowCount)
+                .unwrap_or(0);
+
+            for id in 1..=recurring_count {
+                if let Some(recurring) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, RecurringEscrow>(&DataKey::RecurringEscrow(id))
+                {
+                    if recurring.token == token && recurring.is_active {
+                        expected_locked = expected_locked.saturating_add(
+                            recurring.total_amount.saturating_sub(recurring.released_amount),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Sum all staked amounts
+        let stake_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakedArtisanCount)
+            .unwrap_or(0);
+
+        let mut expected_staked = 0i128;
+        for index in 0..stake_count {
+            if let Some(artisan) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
+            {
+                Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
+                if let Some(stake) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
+                {
+                    if stake.token == token {
+                        expected_staked = expected_staked.saturating_add(stake.amount);
+                    }
+                }
+            }
+        }
+
+        // Read tracked totals
+        let tracked_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked(token.clone()))
+            .unwrap_or(0);
+
+        let tracked_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked(token.clone()))
+            .unwrap_or(0);
+
+        // Determine if complete
+        let complete = end >= total_escrows;
+
+        // Check for discrepancies only when complete
+        let mut unresolved = false;
+        if complete {
+            unresolved = expected_locked != tracked_locked
+                || expected_staked != tracked_staked
+                || balance < expected_locked.saturating_add(expected_staked);
+        }
+
+        Ok(ReconciliationReport {
+            token,
+            balance,
+            expected_locked,
+            expected_staked,
+            tracked_locked,
+            tracked_staked,
+            scanned_escrows: scanned,
+            next_cursor: end,
+            complete,
+            unresolved,
+        })
+    }
+
     pub fn propose_reconciliation_repair(
         env: Env,
         token: Address,
