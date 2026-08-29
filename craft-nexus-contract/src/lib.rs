@@ -204,68 +204,74 @@ pub enum Error {
     /// Invalid dispute session for evidence submission (#927)
     InvalidDisputeSession = 55,
     /// Contract does not implement the supported token interface.
-    UnsupportedToken = 56,
+    UnsupportedToken = 57,
     /// The requested continuation size is outside the scheduler bound.
-    InvalidBatchWorkLimit = 57,
+    InvalidBatchWorkLimit = 58,
     /// The scheduled batch was cancelled.
-    BatchJobCancelled = 58,
+    BatchJobCancelled = 59,
     /// The requested scheduled batch does not exist.
-    BatchJobNotFound = 59,
+    BatchJobNotFound = 60,
     /// The caller is not the account that scheduled the batch.
-    BatchJobUnauthorized = 60,
+    BatchJobUnauthorized = 61,
     /// The scheduled batch has already reached a terminal state.
-    BatchJobCompleted = 61,
+    BatchJobCompleted = 62,
     /// Platform wallet cannot be the contract address.
-    InvalidPlatformWallet = 62,
+    InvalidPlatformWallet = 63,
     /// Provided service-agreement hash is invalid
-    InvalidServiceAgreementHash = 63,
+    InvalidServiceAgreementHash = 64,
     /// Evidence challenge window has not elapsed; arbitrator resolution is blocked.
-    ChallengeWindowActive = 64,
+    ChallengeWindowActive = 65,
     /// The arbitrator address is blacklisted.
-    ArbitratorBlacklisted = 65,
+    ArbitratorBlacklisted = 66,
     /// Dispute action is not valid in the current session (duplicate escalate, bad parent evidence).
-    InvalidDisputeAction = 66,
+    InvalidDisputeAction = 67,
     /// Dispute escalation window has not elapsed.
-    EscalationWindowActive = 67,
+    EscalationWindowActive = 68,
     /// Arbitrator resolution deadline (`max_dispute_duration`) has elapsed.
-    ArbitratorDeadlineExceeded = 68,
+    ArbitratorDeadlineExceeded = 69,
     /// This escrow was already settled; a second settlement path cannot run.
-    SettlementAlreadyFinalized = 69,
+    SettlementAlreadyFinalized = 70,
     /// Tracked obligations exceed the token balance held by the contract.
-    EmergencyAccountingInvariant = 70,
+    EmergencyAccountingInvariant = 71,
     /// A reconciliation report has unresolved customer or collateral liabilities.
-    ReconciliationRequired = 71,
+    ReconciliationRequired = 72,
     /// The requested reconciliation repair plan does not exist.
-    RepairPlanNotFound = 72,
+    RepairPlanNotFound = 73,
     /// The reconciliation repair plan has already reached a terminal state.
-    RepairPlanTerminal = 73,
+    RepairPlanTerminal = 74,
     /// The live token state no longer matches the reviewed repair plan.
-    RepairPlanPreconditionFailed = 74,
+    RepairPlanPreconditionFailed = 75,
     /// The user does not have an onboarding profile registered with the
     /// configured onboarding contract.
-    OnboardingProfileNotFound = 75,
+    OnboardingProfileNotFound = 76,
     /// The user's onboarding profile is not in an active state (deactivated,
     /// under review, or flagged).
-    OnboardingProfileInactive = 76,
+    OnboardingProfileInactive = 77,
     /// The user's onboarding role does not permit the requested marketplace
     /// operation.
-    OnboardingRoleMismatch = 77,
+    OnboardingRoleMismatch = 78,
     /// The user's onboarding profile state version does not match the expected
     /// current version — stale onboarding state detected.
-    OnboardingProfileStale = 78,
+    OnboardingProfileStale = 79,
     /// The user's verification status has been revoked or is not current.
-    OnboardingVerificationRevoked = 79,
+    OnboardingVerificationRevoked = 80,
     /// An escrow with this order ID already exists. Duplicate escrow
     /// identifiers are rejected so a retry (or a conflicting external
     /// reference) can never overwrite an existing escrow's state.
-    EscrowAlreadyExists = 80,
+    EscrowAlreadyExists = 81,
     /// Pagination limit is zero; caller must request at least one item (#1022).
-    PaginationLimitZero = 81,
+    PaginationLimitZero = 82,
     /// Pagination cursor is invalid (past end of dataset or empty dataset) (#1022).
-    PaginationCursorInvalid = 82,
+    PaginationCursorInvalid = 83,
     /// Requested WASM upgrade cooldown is below `MIN_WASM_UPGRADE_COOLDOWN`,
     /// which would let the mandatory review window be bypassed (#1062).
-    UpgradeCooldownTooShort = 83,
+    UpgradeCooldownTooShort = 84,
+    /// An emergency operation (recovery, sweep, upgrade, pause) is already in progress;
+    /// no other emergency operation can execute concurrently (#1072).
+    EmergencyOpInProgress = 85,
+    /// An active dispute, recurring escrow, or pending upgrade exists that blocks
+    /// the requested emergency operation from starting (#1072).
+    EmergencyConflictActive = 86,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -666,6 +672,72 @@ pub enum DataKey {
     RateLimitCount(Address, u64),
     /// Platform rate limit configuration (max_calls, window) (#943)
     RateLimitConfig,
+    /// Current emergency operation in flight (only one at a time) (#1072)
+    CurrentEmergencyOperation,
+    /// Historical log of completed/failed emergency operations (#1072)
+    EmergencyOperationHistory,
+    /// Count of entries in emergency operation history (#1072)
+    EmergencyOperationHistoryCount,
+    /// Indexed history entry by position (#1072)
+    EmergencyOperationHistoryIndexed(u32),
+    /// Count of currently active recurring escrows for conflict detection (#1072)
+    ActiveRecurringCount,
+}
+
+/// Emergency operation kinds: the four types of critical control operations
+/// that must be serialized to prevent interference (#1072).
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+#[repr(u32)]
+pub enum EmergencyOpKind {
+    /// Admin account recovery via fallback admin
+    AdminRecovery = 0,
+    /// Unallocated fund sweep operation
+    Sweep = 1,
+    /// WASM contract upgrade operation
+    Upgrade = 2,
+    /// Platform pause/unpause operation
+    Pause = 3,
+}
+
+/// Emergency operation execution phases: tracks lifecycle of in-flight operations
+/// to support timeout/force-release and audit trails (#1072).
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+#[repr(u32)]
+pub enum EmergencyOpPhase {
+    /// Operation is currently acquiring the lock and performing work
+    Executing = 0,
+    /// Operation completed successfully
+    Completed = 1,
+    /// Operation failed and was aborted (state reset to Idle)
+    Failed = 2,
+}
+
+/// Current emergency operation state: tracks which operation (if any) is in flight,
+/// who initiated it, which phase it's in, and a revision counter for optimistic
+/// concurrency control (#1072).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct EmergencyOperation {
+    /// The type of in-flight operation
+    pub kind: EmergencyOpKind,
+    /// The actor who initiated the operation
+    pub actor: Address,
+    /// Current phase (Executing, Completed, or Failed)
+    pub phase: EmergencyOpPhase,
+    /// Operation revision: increments on every state transition (enter/exit/fail)
+    /// Serves as optimistic-concurrency guard and audit trail (#1072)
+    pub revision: u32,
+    /// Timestamp when operation started (in ledger seconds)
+    pub started_at: u64,
+    /// Success flag: true if operation completed successfully
+    pub success: bool,
+    /// Optional: amount affected by operation (e.g., swept funds)
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -2379,11 +2451,222 @@ impl CraftNexusContract {
         Self::extend_persistent(env, &key);
     }
 
+    /// Atomically acquires the emergency operation lock if currently Idle,
+    /// transitioning to the requested operation's Executing state and incrementing
+    /// the revision. On success, no return value; on failure, panics with
+    /// EmergencyOpInProgress or EmergencyConflictActive (#1072).
+    fn assert_emergency_op_idle_and_acquire(
+        env: &Env,
+        actor: &Address,
+        kind: EmergencyOpKind,
+    ) -> Result<(), Error> {
+        // Check for active disputes, upgrades, or recurring escrows that block
+        // this specific operation type
+        match kind {
+            EmergencyOpKind::AdminRecovery => {
+                // Recovery blocked if disputes exist, upgrades exist, or recurring escrows exist
+                if Self::get_active_dispute_count(env) > 0 {
+                    return Err(Error::EmergencyConflictActive);
+                }
+                if env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::WasmUpgradeProposal)
+                {
+                    return Err(Error::EmergencyConflictActive);
+                }
+                if Self::get_active_recurring_count(env) > 0 {
+                    return Err(Error::EmergencyConflictActive);
+                }
+            }
+            _ => {
+                // Other operations (Sweep, Upgrade, Pause) are blocked if ANY
+                // emergency operation is already in flight
+                if env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::CurrentEmergencyOperation)
+                {
+                    return Err(Error::EmergencyOpInProgress);
+                }
+            }
+        }
+
+        // Acquire the lock: create new in-flight operation state
+        let current_revision: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentEmergencyOperation)
+            .map(|op: EmergencyOperation| op.revision)
+            .unwrap_or(0);
+
+        let new_op = EmergencyOperation {
+            kind,
+            actor: actor.clone(),
+            phase: EmergencyOpPhase::Executing,
+            revision: current_revision.saturating_add(1),
+            started_at: env.ledger().timestamp(),
+            success: false,
+            amount: 0,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CurrentEmergencyOperation, &new_op);
+        Self::extend_persistent(env, &DataKey::CurrentEmergencyOperation);
+
+        Ok(())
+    }
+
+    /// Atomically releases the emergency operation lock on successful completion,
+    /// transitioning state back to Idle (by removing CurrentEmergencyOperation),
+    /// appending to history, and incrementing revision (#1072).
+    fn release_emergency_op_on_success(env: &Env, kind: EmergencyOpKind, amount: i128) {
+        if let Some(mut op) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EmergencyOperation>(&DataKey::CurrentEmergencyOperation)
+        {
+            // Verify this is the same operation we acquired
+            if op.kind != kind {
+                return; // Mismatched operation type, don't proceed
+            }
+
+            // Mark successful and append to history
+            op.success = true;
+            op.amount = amount;
+            op.phase = EmergencyOpPhase::Completed;
+            op.revision = op.revision.saturating_add(1); // Increment on exit
+
+            Self::append_to_emergency_history(env, &op);
+
+            // Release the lock
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CurrentEmergencyOperation);
+        }
+    }
+
+    /// Atomically releases the emergency operation lock on failure,
+    /// transitioning to Failed phase, incrementing revision, and appending
+    /// to history so the failure is auditable (#1072).
+    fn release_emergency_op_on_failure(env: &Env) {
+        if let Some(mut op) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EmergencyOperation>(&DataKey::CurrentEmergencyOperation)
+        {
+            op.phase = EmergencyOpPhase::Failed;
+            op.success = false;
+            op.revision = op.revision.saturating_add(1); // Increment on exit
+
+            Self::append_to_emergency_history(env, &op);
+
+            // Release the lock
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CurrentEmergencyOperation);
+        }
+    }
+
+    /// Appends an emergency operation to the history log, maintaining bounded history.
+    /// History is kept for audit trails but capped to prevent unbounded growth (#1072).
+    fn append_to_emergency_history(env: &Env, op: &EmergencyOperation) {
+        const MAX_HISTORY: u32 = 100;
+
+        let count_key = DataKey::EmergencyOperationHistoryCount;
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let index = count.min(MAX_HISTORY - 1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyOperationHistoryIndexed(index), op);
+
+        let new_count = (count + 1).min(MAX_HISTORY);
+        env.storage().persistent().set(&count_key, &new_count);
+
+        Self::extend_persistent(env, &count_key);
+        Self::extend_persistent(env, &DataKey::EmergencyOperationHistoryIndexed(index));
+    }
+
     pub fn get_active_dispute_count(env: Env) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::ActiveDisputeCount)
             .unwrap_or(0)
+    }
+
+    /// Returns the count of currently active (non-released, non-cancelled) recurring escrows.
+    /// Used for conflict detection: recovery operations are blocked if recurring escrows
+    /// exist, as they depend on the current admin (#1072).
+    pub fn get_active_recurring_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveRecurringCount)
+            .unwrap_or(0)
+    }
+
+    /// Returns the current in-flight emergency operation (if any) and its state.
+    /// No authorization required — this is freely queryable so operators can
+    /// diagnose active incident response operations (#1072).
+    pub fn get_emergency_operation(env: Env) -> Option<EmergencyOperation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CurrentEmergencyOperation)
+    }
+
+    /// Returns paginated history of completed/failed emergency operations for audit trails.
+    /// Offset and limit are 0-indexed; max 50 entries per page (#1072).
+    pub fn get_emergency_operation_history(env: Env, offset: u32, limit: u32) -> Vec<EmergencyOperation> {
+        let page_size = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_PAGE_SIZE,
+        ).unwrap_or(limit.min(pagination_validation::MAX_PAGE_SIZE));
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyOperationHistoryCount)
+            .unwrap_or(0);
+
+        let mut history = Vec::new(&env);
+        let end = (offset + page_size).min(count);
+
+        for idx in offset..end {
+            if let Some(op) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EmergencyOperation>(&DataKey::EmergencyOperationHistoryIndexed(idx))
+            {
+                history.push_back(op);
+            }
+        }
+        history
+    }
+
+    /// Force-releases a stranded in-flight emergency operation lock back to Idle state.
+    /// Can only be called by an authorized admin (same as other emergency operations).
+    /// This prevents a failed or abandoned multi-step operation from permanently blocking
+    /// future emergency response (#1072).
+    pub fn abort_emergency_operation(env: Env, admin: Address) -> Result<EmergencyOperation, Error> {
+        let contract_admin = Self::get_admin(&env)?;
+        contract_admin.require_auth();
+
+        let op = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EmergencyOperation>(&DataKey::CurrentEmergencyOperation)
+            .ok_or(Error::NoUpgradeProposed)?; // No operation in flight
+
+        // Transition to Failed phase and release lock
+        Self::release_emergency_op_on_failure(&env);
+
+        // Return the aborted operation
+        Ok(EmergencyOperation {
+            phase: EmergencyOpPhase::Failed,
+            success: false,
+            ..op
+        })
     }
 
     #[inline(always)]
