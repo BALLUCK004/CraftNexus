@@ -2465,7 +2465,7 @@ impl CraftNexusContract {
         match kind {
             EmergencyOpKind::AdminRecovery => {
                 // Recovery blocked if disputes exist, upgrades exist, or recurring escrows exist
-                if Self::get_active_dispute_count(env) > 0 {
+                if Self::get_active_dispute_count(env.clone()) > 0 {
                     return Err(Error::EmergencyConflictActive);
                 }
                 if env
@@ -2475,7 +2475,7 @@ impl CraftNexusContract {
                 {
                     return Err(Error::EmergencyConflictActive);
                 }
-                if Self::get_active_recurring_count(env) > 0 {
+                if Self::get_active_recurring_count(env.clone()) > 0 {
                     return Err(Error::EmergencyConflictActive);
                 }
             }
@@ -9229,34 +9229,36 @@ impl CraftNexusContract {
             return Err(Error::EscrowNotFound);
         }
         Self::extend_persistent(&env, &(ESCROW, order_id));
-        let snapshot = snapshot_opt.unwrap();
+        let mut snapshot = snapshot_opt.unwrap();
 
         let config = Self::get_platform_config_internal(&env);
         // The deadline guard: if the dispute is still within the allowed window
         // the arbitrator must resolve it via `resolve_dispute`. Returning an
         // error (rather than panicking) allows the caller to detect this case
         // without rolling back unrelated ledger state.
-        if (initiated_at as u64) + config.max_dispute_duration as u64 > current_time {
+        if (snapshot.dispute_initiated_at.unwrap_or(0)) + config.max_dispute_duration as u64
+            > env.ledger().timestamp()
+        {
             return Err(Error::DisputeExpired);
         }
 
         let operation_id = Self::onboarding_operation_id(&env, b"resolve_expired_dispute:", order_id);
-        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
-        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
+        Self::authorize_onboarding_state(&env, &snapshot.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &snapshot.seller, operation_id, UserRole::Artisan);
 
         // --- Effects (CEI: all writes before the token transfer) ---
 
         // CRITICAL: Update status BEFORE external calls (CEI pattern)
-        escrow.status = EscrowStatus::Resolved;
-        env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        snapshot.status = EscrowStatus::Resolved;
+        env.storage().persistent().set(&(ESCROW, order_id), &snapshot);
 
         // Decrement active counts
-        Self::update_active_obligations(&env, &escrow.buyer, -1);
-        Self::update_active_obligations(&env, &escrow.seller, -1);
+        Self::update_active_obligations(&env, &snapshot.buyer, -1);
+        Self::update_active_obligations(&env, &snapshot.seller, -1);
 
-        Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
-        Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
-        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+        Self::safe_update_active_contracts(&env, snapshot.buyer.clone(), -1);
+        Self::safe_update_active_contracts(&env, snapshot.seller.clone(), -1);
+        Self::update_total_locked(&env, &snapshot.token, -snapshot.amount);
 
         let fee_bps = Self::get_effective_fee_bps(env.clone(), snapshot.seller.clone());
         let settlement_kind = match config.expired_dispute_fee_policy {
@@ -10002,8 +10004,8 @@ impl CraftNexusContract {
             return Err(Error::Unauthorized);
         }
         let operation_id = Self::onboarding_operation_id(&env, b"accept_partial_refund:", order_id);
-        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
-        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
+        Self::authorize_onboarding_state(&env, &snapshot.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &snapshot.seller, operation_id, UserRole::Artisan);
 
         let (_seller_gross, allocation) =
             Self::validate_partial_refund_solvency(&env, &snapshot, proposal.refund_amount)?;
@@ -10072,7 +10074,7 @@ impl CraftNexusContract {
         Self::authorize_onboarding_state(&env, &proposal.proposed_by, operation_id, expected_role);
 
         // Remove the proposal from storage
-        env.storage().persistent().remove(&proposal_key);
+        env.storage().persistent().remove(&Self::proposal_key(order_id));
 
         Ok(())
     }
@@ -10081,6 +10083,43 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .get(&Self::settlement_receipt_key(order_id))
+    }
+
+    /// Deterministic per-cycle release amount for a recurring escrow.
+    ///
+    /// Splits `total_amount` across `duration` cycles without rounding drift:
+    /// every non-final cycle releases `total / duration`, and the **final**
+    /// cycle releases the exact residual (`total - released`). This keeps the
+    /// accounting invariant `released + remaining == total_amount` at all
+    /// times, so:
+    ///   - the final cycle always releases the exact remaining balance,
+    ///   - a cancellation refund always equals the residual un-released amount,
+    ///   - the contract can never be left holding more funds than the escrow
+    ///     state records.
+    ///
+    /// The regular-cycle amount is clamped to the un-released balance as a
+    /// belt-and-braces guard against over-release (fund exhaustion) if state
+    /// ever drifts.
+    fn recurring_release_amount(escrow: &RecurringEscrow) -> i128 {
+        let duration = escrow.duration as i128;
+        debug_assert!(duration > 0);
+        let remaining = escrow.total_amount - escrow.released_amount;
+        if escrow.current_cycle as i128 == duration - 1 {
+            // Final cycle: release the exact residual.
+            remaining
+        } else {
+            // Regular cycle: deterministic quotient, clamped to remaining.
+            (escrow.total_amount / duration).max(0).min(remaining)
+        }
+    }
+
+    /// Panics if the recurring escrow accounting invariant is violated:
+    /// `0 <= released_amount <= total_amount`. Guarantees the tracked locked
+    /// balance can never go negative or over-represent the escrow state.
+    fn assert_recurring_accounting_invariant(env: &Env, escrow: &RecurringEscrow) {
+        if escrow.released_amount < 0 || escrow.released_amount > escrow.total_amount {
+            env.panic_with_error(crate::Error::InvalidEscrowState);
+        }
     }
 
     /// Create a new recurring escrow for recurring payments/subscriptions.
@@ -10213,9 +10252,22 @@ impl CraftNexusContract {
         if escrow.current_cycle >= escrow.duration as u64 {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
+        // Defense-in-depth: a fully-released escrow can never release again,
+        // even if state corruption left `is_active` true. This prevents
+        // cycle release after the escrow is already inactive (fund exhaustion).
+        Self::assert_recurring_accounting_invariant(&env, &escrow);
+        if escrow.released_amount >= escrow.total_amount {
+            env.panic_with_error(crate::Error::InvalidEscrowState);
+        }
 
         let now = env.ledger().timestamp();
-        if now < escrow.last_release_time + escrow.frequency {
+        // `checked_add` prevents a wrap that would incorrectly allow an early
+        // cycle release when `last_release_time + frequency` overflows.
+        let next_due = escrow
+            .last_release_time
+            .checked_add(escrow.frequency)
+            .unwrap_or(u64::MAX);
+        if now < next_due {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
 
@@ -10227,12 +10279,9 @@ impl CraftNexusContract {
         Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
         Self::authorize_onboarding_state(&env, &escrow.artisan, operation_id, UserRole::Artisan);
 
-        let cycle_amount = if escrow.current_cycle == (escrow.duration as u64) - 1 {
-            // Last cycle: handle remainder
-            escrow.total_amount - escrow.released_amount
-        } else {
-            escrow.total_amount / (escrow.duration as i128)
-        };
+        // Deterministic cycle allocator: non-final cycles release
+        // `total / duration`, the final cycle releases the exact residual.
+        let cycle_amount = Self::recurring_release_amount(&escrow);
 
         // Calculate distribution amounts using the deterministic fee engine.
         let config = Self::get_platform_config_internal(&env);
@@ -10245,6 +10294,9 @@ impl CraftNexusContract {
         escrow.released_amount += cycle_amount;
         escrow.current_cycle += 1;
         escrow.last_release_time = now;
+
+        // Post-mutation invariant: released + remaining == total_amount.
+        Self::assert_recurring_accounting_invariant(&env, &escrow);
 
         let became_inactive = escrow.current_cycle == escrow.duration as u64;
         if became_inactive {
@@ -10346,12 +10398,18 @@ impl CraftNexusContract {
         Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
         Self::authorize_onboarding_state(&env, &escrow.artisan, operation_id, UserRole::Artisan);
 
+        // Accounting invariant: 0 <= released <= total, so the residual
+        // `total - released` is always a valid, non-negative refund amount.
+        Self::assert_recurring_accounting_invariant(&env, &escrow);
         let remaining = escrow.total_amount - escrow.released_amount;
 
         // CEI Pattern: EFFECTS - Update state BEFORE external calls
         escrow.is_active = false;
         env.storage().persistent().set(&key, &escrow);
         Self::extend_persistent(&env, &key);
+
+        // Post-mutation invariant still holds: released + remaining == total.
+        Self::assert_recurring_accounting_invariant(&env, &escrow);
 
         // Decrement active recurring counts
         Self::update_active_obligations(&env, &escrow.buyer, -1);
@@ -10879,7 +10937,7 @@ impl CraftNexusContract {
 
 
 #[cfg(test)]
-mod deactivated_account_tests {
+mod deactivated_account_tests_scaffold {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as AddressTestUtils, MockAuthContract},
