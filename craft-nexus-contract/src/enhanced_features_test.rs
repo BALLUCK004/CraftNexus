@@ -118,6 +118,19 @@ fn test_recurring_escrow_lifecycle() {
 }
 
 #[test]
+fn test_escrow_rejects_onboarding_state_change_before_authorization() {
+    let env = Env::default();
+    let (escrow, onboarding, buyer, artisan, token_id, token_admin, _, _) =
+        setup_enhanced_test(&env);
+    token_admin.mint(&buyer, &1_000_000);
+
+    onboarding.update_user_role(&buyer, &UserRole::Artisan);
+    assert!(escrow
+        .try_create_escrow(&buyer, &artisan, &token_id, &1_000_000, &99, &None)
+        .is_err());
+}
+
+#[test]
 fn test_cancel_recurring_escrow() {
     let env = Env::default();
     let (escrow, _, buyer, artisan, token_id, token_admin, _, _) = setup_enhanced_test(&env);
