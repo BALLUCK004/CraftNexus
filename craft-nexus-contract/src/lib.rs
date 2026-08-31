@@ -22,6 +22,8 @@ mod event_snapshot_test;
 #[cfg(test)]
 mod expired_dispute_fee_test;
 #[cfg(test)]
+mod admin_idempotency_test;
+#[cfg(test)]
 mod min_release_window_test;
 #[cfg(test)]
 mod reentrancy_test;
@@ -272,6 +274,12 @@ pub enum Error {
     /// An active dispute, recurring escrow, or pending upgrade exists that blocks
     /// the requested emergency operation from starting (#1072).
     EmergencyConflictActive = 86,
+    /// The caller supplied an admin revision that does not match the current
+    /// monotonic revision; the request is stale and no mutation was applied (#1071).
+    StaleAdminRevision = 87,
+    /// This admin mutation was already applied at the supplied revision.
+    /// Replaying it is a no-op failure: storage is unchanged (#1071).
+    AdminActionAlreadyApplied = 88,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -297,6 +305,7 @@ pub fn is_retryable(error: Error) -> bool {
             | Error::ChallengeWindowActive
             | Error::EscalationWindowActive
             | Error::ArbitratorDeadlineExceeded
+            | Error::StaleAdminRevision
     )
 }
 
@@ -432,6 +441,7 @@ const MAX_UPGRADE_HISTORY: u32 = 32;
 
 /// Symbol topics emitted alongside `UpgradeProposalEvent`.
 const UPGRADE_PROPOSED: Symbol = symbol_short!("UPG_PROP");
+const UPGRADE_APPROVED: Symbol = symbol_short!("UPG_APPR");
 const UPGRADE_CANCELLED: Symbol = symbol_short!("UPG_CANC");
 const UPGRADE_EXECUTED: Symbol = symbol_short!("UPG_EXEC");
 /// Maximum number of stake history entries per artisan (bounded queue to prevent storage bloat) (#237)
@@ -491,6 +501,8 @@ pub struct AdminActionProposal {
     pub ready_at: u64,
     pub executed: bool,
     pub cancelled: bool,
+    /// Revision consumed when this action executed. Zero until execution.
+    pub applied_revision: u32,
 }
 
 /// Storage keys for the admin action proposal system.
@@ -682,6 +694,16 @@ pub enum DataKey {
     EmergencyOperationHistoryIndexed(u32),
     /// Count of currently active recurring escrows for conflict detection (#1072)
     ActiveRecurringCount,
+    /// Monotonic admin-mutation revision. Incremented on every successful
+    /// configuration, pause, recovery, or governance write (#1071).
+    AdminRevision,
+    /// SHA-256 fingerprint of the last successfully applied admin mutation.
+    AdminMutationFingerprint,
+    /// Revision that was consumed by the last successful admin mutation.
+    LastAppliedAdminRevision,
+    /// Canonical per-signer upgrade approval keyed by proposal nonce and
+    /// signer address so each signer can count at most once (#1059).
+    UpgradeSignerApproval(u32, Address),
 }
 
 /// Emergency operation kinds: the four types of critical control operations
@@ -1192,6 +1214,8 @@ pub struct ConfigUpdatedEvent {
     pub field_name: Symbol,
     pub old_value: ConfigValue,
     pub new_value: ConfigValue,
+    /// Admin revision consumed by the write that produced this event (#1071).
+    pub revision: u32,
 }
 
 /// Emitted when an artisan's negotiated platform-fee tier is set or changed.
@@ -1340,6 +1364,8 @@ pub struct MetadataVerifiedEvent {
 pub struct PlatformPausedEvent {
     pub initiator: Address,
     pub timestamp: u64,
+    /// Admin revision consumed by this pause (#1071).
+    pub revision: u32,
 }
 
 #[contracttype]
@@ -1348,6 +1374,8 @@ pub struct PlatformPausedEvent {
 pub struct PlatformUnpausedEvent {
     pub initiator: Address,
     pub timestamp: u64,
+    /// Admin revision consumed by this unpause (#1071).
+    pub revision: u32,
 }
 
 #[contracttype]
@@ -1410,6 +1438,26 @@ pub struct UpgradeProposalEvent {
     pub admin: Address,
     pub timestamp: u64,
     pub upgrade_at: u64,
+}
+
+/// Emitted for every distinct upgrade-signer approval of a proposal round.
+///
+/// Indexers key on `(nonce, signer)` — the same pair can never appear twice
+/// for a live round because storage is canonicalized under
+/// `DataKey::UpgradeSignerApproval(nonce, signer)` (#1059).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UpgradeApprovalEvent {
+    /// Proposal round nonce (revision) this approval belongs to.
+    pub nonce: u32,
+    /// Signer that submitted this approval.
+    pub signer: Address,
+    /// WASM hash being approved.
+    pub wasm_hash: BytesN<32>,
+    pub timestamp: u64,
+    /// Number of distinct approvals recorded after this one was accepted.
+    pub approval_count: u32,
 }
 
 /// On-chain record of a completed WASM upgrade.
@@ -2253,8 +2301,114 @@ impl CraftNexusContract {
                 field_name: Symbol::new(env, field_name),
                 old_value,
                 new_value,
+                revision: Self::last_applied_admin_revision(env),
             },
         );
+    }
+
+    fn current_admin_revision(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminRevision)
+            .unwrap_or(0u32)
+    }
+
+    fn last_applied_admin_revision(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastAppliedAdminRevision)
+            .unwrap_or(0u32)
+    }
+
+    fn hash_admin_mutation(env: &Env, label: &str, payload: Bytes) -> BytesN<32> {
+        let mut data = Bytes::from_slice(env, label.as_bytes());
+        data.append(&payload);
+        env.crypto().sha256(&data).into()
+    }
+
+    /// Bind an admin mutation to `expected_revision`.
+    ///
+    /// * Replay of the same fingerprint at the revision that already applied it
+    ///   returns [`Error::AdminActionAlreadyApplied`] without writing.
+    /// * A mismatched revision returns [`Error::StaleAdminRevision`].
+    /// * On success the monotonic revision advances by one and the applied
+    ///   revision is stored for event emission (#1071).
+    fn commit_admin_mutation(
+        env: &Env,
+        expected_revision: u32,
+        fingerprint: BytesN<32>,
+    ) -> Result<u32, Error> {
+        let current = Self::current_admin_revision(env);
+        let last_fp: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminMutationFingerprint);
+        let last_rev = Self::last_applied_admin_revision(env);
+
+        if last_fp.as_ref() == Some(&fingerprint) && last_rev == expected_revision {
+            return Err(Error::AdminActionAlreadyApplied);
+        }
+        if expected_revision != current {
+            return Err(Error::StaleAdminRevision);
+        }
+        if last_fp.as_ref() == Some(&fingerprint) {
+            return Err(Error::AdminActionAlreadyApplied);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminMutationFingerprint, &fingerprint);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastAppliedAdminRevision, &expected_revision);
+        let next = current.saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminRevision, &next);
+        Ok(expected_revision)
+    }
+
+    fn gate_admin_mutation(env: &Env, label: &str, payload: Bytes) -> Result<u32, Error> {
+        let fingerprint = Self::hash_admin_mutation(env, label, payload);
+        Self::commit_admin_mutation(env, Self::current_admin_revision(env), fingerprint)
+    }
+
+    /// Current monotonic admin revision. Callers of
+    /// [`Self::apply_admin_mutation`] must pass this value.
+    pub fn get_admin_revision(env: Env) -> u32 {
+        Self::current_admin_revision(&env)
+    }
+
+    /// Apply a configuration, pause, or governance mutation at an explicit
+    /// revision. Stale or already-applied requests fail without writing (#1071).
+    pub fn apply_admin_mutation(
+        env: Env,
+        expected_revision: u32,
+        action: AdminActionKind,
+    ) -> Result<u32, Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+        let fingerprint = Self::hash_admin_mutation(
+            &env,
+            "apply_admin_mutation",
+            action.to_xdr(&env),
+        );
+        let revision = Self::commit_admin_mutation(&env, expected_revision, fingerprint)?;
+        let proposal = AdminActionProposal {
+            id: 0,
+            kind: action,
+            proposer: admin,
+            approvals: Vec::new(&env),
+            threshold: 1,
+            signers: Vec::new(&env),
+            created_at: env.ledger().timestamp(),
+            ready_at: env.ledger().timestamp(),
+            executed: false,
+            cancelled: false,
+            applied_revision: revision,
+        };
+        Self::apply_admin_action(&env, &proposal)?;
+        Ok(revision)
     }
 
     fn emit_artisan_fee_tier_updated(env: &Env, artisan: Address, fee_bps: u32) {
@@ -2284,6 +2438,7 @@ impl CraftNexusContract {
             PlatformPausedEvent {
                 initiator,
                 timestamp: env.ledger().timestamp(),
+                revision: Self::last_applied_admin_revision(env),
             },
         );
     }
@@ -2297,6 +2452,7 @@ impl CraftNexusContract {
             PlatformUnpausedEvent {
                 initiator,
                 timestamp: env.ledger().timestamp(),
+                revision: Self::last_applied_admin_revision(env),
             },
         );
     }
@@ -3753,6 +3909,9 @@ impl CraftNexusContract {
         env.storage()
             .instance()
             .set(&DataKey::PlatformConfig, &config);
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminRevision, &0u32);
 
         if let Err(e) = Self::set_fallback_admin(&env, admin.clone()) {
             env.panic_with_error(e);
@@ -4006,6 +4165,7 @@ impl CraftNexusContract {
             ready_at: created_at + delay,
             executed: false,
             cancelled: false,
+            applied_revision: 0,
         };
 
         env.storage()
@@ -4086,9 +4246,18 @@ impl CraftNexusContract {
             return Err(Error::AdminActionTimelockActive);
         }
 
+        let fingerprint = Self::hash_admin_mutation(
+            &env,
+            "execute_admin_action",
+            action.kind.to_xdr(&env),
+        );
+        let revision =
+            Self::commit_admin_mutation(&env, Self::current_admin_revision(&env), fingerprint)?;
+
         let mut persisted = action.clone();
         Self::apply_admin_action(&env, &persisted)?;
         persisted.executed = true;
+        persisted.applied_revision = revision;
         Self::persist_admin_action(&env, &persisted);
         Ok(())
     }
@@ -4464,6 +4633,13 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .remove(&DataKey::AdminRecoveryDelay);
+
+        let fingerprint = Self::hash_admin_mutation(
+            &env,
+            "recover_admin_access",
+            recovered_admin.to_xdr(&env),
+        );
+        Self::commit_admin_mutation(&env, Self::current_admin_revision(&env), fingerprint)?;
 
         // Emit audit event
         Self::emit_admin_changed(&env, previous_admin, recovered_admin, "admin_recovered");
@@ -5754,6 +5930,19 @@ impl CraftNexusContract {
         Ok(())
     }
 
+    fn expired_dispute_settlement_kind(policy: ExpiredDisputeFeePolicy) -> SettlementKind {
+        match policy {
+            ExpiredDisputeFeePolicy::RefundFullNoPlatformFee => SettlementKind::FullRefundNoFee,
+            ExpiredDisputeFeePolicy::RefundMinusPlatformFee => {
+                SettlementKind::ExpiredDisputeDeductFromBuyer
+            }
+            ExpiredDisputeFeePolicy::DeductFeeFromSeller => {
+                SettlementKind::ExpiredDisputeDeductFromSeller
+            }
+            ExpiredDisputeFeePolicy::SplitFee => SettlementKind::ExpiredDisputeSplitFee,
+        }
+    }
+
     /// Atomically claim a disputed escrow for a single settlement path.
     fn claim_disputed_settlement(env: &Env, order_id: u32) -> Result<Escrow, Error> {
         Self::assert_no_prior_settlement(env, order_id)?;
@@ -6478,6 +6667,25 @@ impl CraftNexusContract {
         );
     }
 
+    fn emit_upgrade_approval_event(
+        env: &Env,
+        nonce: u32,
+        signer: Address,
+        wasm_hash: BytesN<32>,
+        approval_count: u32,
+    ) {
+        env.events().publish(
+            (Symbol::new(env, "wasm_upgrade"), UPGRADE_APPROVED),
+            UpgradeApprovalEvent {
+                nonce,
+                signer,
+                wasm_hash,
+                timestamp: env.ledger().timestamp(),
+                approval_count,
+            },
+        );
+    }
+
     /// Propose a new WASM code for the contract (multi-sig).
     ///
     /// Each authorized upgrade signer calls this function with the same
@@ -6582,10 +6790,29 @@ impl CraftNexusContract {
             return Err(Error::NotAnUpgradeSigner);
         }
 
-        if state.approvals.iter().any(|a| a == signer) {
+        // Canonical per-(nonce, signer) slot is the source of truth (#1059).
+        let approval_key = DataKey::UpgradeSignerApproval(state.nonce, signer.clone());
+        if env.storage().persistent().has(&approval_key)
+            || state.approvals.iter().any(|a| a == signer)
+        {
+            return Err(Error::AlreadyApproved);
+        }
+        if state.approvals.len() >= state.signers.len() {
             return Err(Error::AlreadyApproved);
         }
         state.approvals.push_back(signer.clone());
+        if state.approvals.len() > state.signers.len() {
+            return Err(Error::AlreadyApproved);
+        }
+        env.storage().persistent().set(&approval_key, &true);
+        Self::extend_persistent(&env, &approval_key);
+        Self::emit_upgrade_approval_event(
+            &env,
+            state.nonce,
+            signer.clone(),
+            new_wasm_hash.clone(),
+            state.approvals.len(),
+        );
 
         // All entries in state.approvals were validated against state.signers
         // when they were added, so a simple length check is sufficient.
@@ -6628,6 +6855,9 @@ impl CraftNexusContract {
         }
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&threshold.to_be_bytes());
+        Self::gate_admin_mutation(&env, "set_upgrade_threshold", payload)?;
         env.storage()
             .instance()
             .set(&DataKey::UpgradeThreshold, &threshold);
@@ -6639,6 +6869,7 @@ impl CraftNexusContract {
     pub fn set_upgrade_signers(env: Env, signers: Vec<Address>) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
+        Self::gate_admin_mutation(&env, "set_upgrade_signers", signers.to_xdr(&env))?;
         if signers.is_empty() {
             env.storage().persistent().remove(&DataKey::UpgradeSigners);
         } else {
@@ -6684,6 +6915,13 @@ impl CraftNexusContract {
             .filter(|s| s.nonce == nonce)
             .map(|s| s.approvals)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// True iff `signer` already holds a canonical approval for `nonce` (#1059).
+    pub fn has_upgrade_approval(env: Env, nonce: u32, signer: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::UpgradeSignerApproval(nonce, signer))
     }
 
     /// Return the state summary that migration tooling must snapshot in its
@@ -8144,6 +8382,12 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::InvalidFee);
         }
 
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&new_fee_bps.to_be_bytes());
+        if let Err(e) = Self::gate_admin_mutation(&env, "update_platform_fee", payload) {
+            env.panic_with_error(e);
+        }
+
         let new_config = PlatformConfig {
             platform_fee_bps: new_fee_bps,
             platform_wallet: config.platform_wallet,
@@ -8183,6 +8427,14 @@ impl CraftNexusContract {
 
         // Reject invalid wallet addresses before writing to storage (#707).
         if let Err(e) = Self::validate_platform_wallet(&env, &new_wallet) {
+            env.panic_with_error(e);
+        }
+
+        if let Err(e) = Self::gate_admin_mutation(
+            &env,
+            "update_platform_wallet",
+            new_wallet.to_xdr(&env),
+        ) {
             env.panic_with_error(e);
         }
 
@@ -8234,6 +8486,10 @@ impl CraftNexusContract {
         let mut config = Self::get_platform_config_internal(&env);
         config.admin.require_auth();
 
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&(policy as u32).to_be_bytes());
+        Self::gate_admin_mutation(&env, "update_expired_dispute_policy", payload)?;
+
         let old_policy = config.expired_dispute_fee_policy;
         config.expired_dispute_fee_policy = policy;
 
@@ -8265,6 +8521,13 @@ impl CraftNexusContract {
     pub fn set_moderator(env: Env, moderator: Address) {
         let mut config = Self::get_platform_config(env.clone());
         config.admin.require_auth();
+        if let Err(e) = Self::gate_admin_mutation(
+            &env,
+            "set_moderator",
+            moderator.to_xdr(&env),
+        ) {
+            env.panic_with_error(e);
+        }
         let previous = config
             .moderator
             .clone()
@@ -9131,6 +9394,12 @@ impl CraftNexusContract {
             .unwrap_or_else(|_| env.panic_with_error(crate::Error::Unauthorized));
         admin.require_auth();
 
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&[u8::from(paused)]);
+        if let Err(e) = Self::gate_admin_mutation(&env, "set_paused", payload) {
+            env.panic_with_error(e);
+        }
+
         let mut config = Self::get_platform_config_internal(&env);
         config.is_paused = paused;
         env.storage()
@@ -9162,6 +9431,12 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::InvalidFee);
         }
 
+        let mut payload = artisan.to_xdr(&env);
+        payload.extend_from_slice(&fee_bps.to_be_bytes());
+        if let Err(e) = Self::gate_admin_mutation(&env, "set_artisan_fee_tier", payload) {
+            env.panic_with_error(e);
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::ArtisanFeeTier(artisan.clone()), &fee_bps);
@@ -9186,6 +9461,20 @@ impl CraftNexusContract {
 
     /// Force-close a dispute that the arbitrator failed to resolve within `max_dispute_duration`.
     ///
+    /// ## Explicit expired-dispute refund policy (#1055)
+    ///
+    /// | Field | Value |
+    /// |---|---|
+    /// | Predecessor state | `EscrowStatus::Disputed` with `dispute_initiated_at` set |
+    /// | Eligible caller | Anyone (permissionless safety net) |
+    /// | Deadline | `now >= dispute_initiated_at + max_dispute_duration` (exact second inclusive) |
+    /// | Terminal successor | `EscrowStatus::Resolved` via `SettlementPath::ExpiredDispute` |
+    /// | Fee treatment | Operator-configured [`ExpiredDisputeFeePolicy`]; allocation always sums to the escrow pot |
+    ///
+    /// After the deadline, `resolve_dispute`, `resolve_dispute_partial`, and
+    /// `accept_partial_refund` are rejected with [`Error::ArbitratorDeadlineExceeded`].
+    /// The only remaining settlement path is this function.
+    ///
     /// ## Role in the dispute lifecycle
     ///
     /// This is the **safety-net exit** from the `Disputed` state. When the
@@ -9205,11 +9494,12 @@ impl CraftNexusContract {
     /// |---------------------------|-------------------------|-------------------|
     /// | `RefundFullNoPlatformFee` | full `amount`           | nothing           |
     /// | `RefundMinusPlatformFee`  | `amount − fee`          | `fee`             |
-    /// | `DeductFeeFromSeller`     | full `amount`           | nothing           |
+    /// | `DeductFeeFromSeller`     | full `amount`           | nothing (seller opportunity cost) |
     /// | `SplitFee`                | `amount − fee/2`        | `fee/2`           |
     ///
     /// The default policy is `RefundFullNoPlatformFee`, protecting buyers from
-    /// arbitrator failure without penalizing them.
+    /// arbitrator failure without penalizing them. Every policy conserves the
+    /// escrow pot: `platform_fee + seller_amount + buyer_amount == amount`.
     ///
     /// ## CEI pattern
     ///
@@ -9222,55 +9512,29 @@ impl CraftNexusContract {
     /// * [`Error::InvalidEscrowState`] — the escrow is not currently `Disputed`.
     /// * [`Error::DisputeExpired`] — the `max_dispute_duration` deadline has **not**
     ///   yet passed; the regular `resolve_dispute` path must be used instead.
+    /// * [`Error::SettlementAlreadyFinalized`] — another settlement path already ran.
     pub fn resolve_expired_dispute(env: Env, order_id: u32) -> Result<(), Error> {
         let _guard = ReentryGuardScope::new(&env);
         let snapshot_opt: Option<Escrow> = env.storage().persistent().get(&(ESCROW, order_id));
-        if snapshot_opt.is_none() {
-            return Err(Error::EscrowNotFound);
-        }
+        let snapshot = snapshot_opt.ok_or(Error::EscrowNotFound)?;
         Self::extend_persistent(&env, &(ESCROW, order_id));
-        let snapshot = snapshot_opt.unwrap();
 
         let config = Self::get_platform_config_internal(&env);
-        // The deadline guard: if the dispute is still within the allowed window
-        // the arbitrator must resolve it via `resolve_dispute`. Returning an
-        // error (rather than panicking) allows the caller to detect this case
-        // without rolling back unrelated ledger state.
-        if (initiated_at as u64) + config.max_dispute_duration as u64 > current_time {
-            return Err(Error::DisputeExpired);
-        }
+        Self::assert_open_for_settlement(&env, &snapshot, order_id)?;
+        Self::assert_expired_dispute_window(&env, &snapshot, &config)?;
 
-        let operation_id = Self::onboarding_operation_id(&env, b"resolve_expired_dispute:", order_id);
-        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
-        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
-
-        // --- Effects (CEI: all writes before the token transfer) ---
-
-        // CRITICAL: Update status BEFORE external calls (CEI pattern)
-        escrow.status = EscrowStatus::Resolved;
-        env.storage().persistent().set(&(ESCROW, order_id), &escrow);
-
-        // Decrement active counts
-        Self::update_active_obligations(&env, &escrow.buyer, -1);
-        Self::update_active_obligations(&env, &escrow.seller, -1);
-
-        Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
-        Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
-        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+        let operation_id =
+            Self::onboarding_operation_id(&env, b"resolve_expired_dispute:", order_id);
+        Self::authorize_onboarding_state(
+            &env,
+            &snapshot.buyer,
+            operation_id.clone(),
+            UserRole::Buyer,
+        );
+        Self::authorize_onboarding_state(&env, &snapshot.seller, operation_id, UserRole::Artisan);
 
         let fee_bps = Self::get_effective_fee_bps(env.clone(), snapshot.seller.clone());
-        let settlement_kind = match config.expired_dispute_fee_policy {
-            ExpiredDisputeFeePolicy::RefundFullNoPlatformFee => {
-                SettlementKind::ExpiredDisputeDeductFromSeller
-            }
-            ExpiredDisputeFeePolicy::RefundMinusPlatformFee => {
-                SettlementKind::ExpiredDisputeDeductFromBuyer
-            }
-            ExpiredDisputeFeePolicy::DeductFeeFromSeller => {
-                SettlementKind::ExpiredDisputeDeductFromSeller
-            }
-            ExpiredDisputeFeePolicy::SplitFee => SettlementKind::ExpiredDisputeSplitFee,
-        };
+        let settlement_kind = Self::expired_dispute_settlement_kind(config.expired_dispute_fee_policy);
         let allocation =
             Self::compute_fee_allocation(&env, snapshot.amount, fee_bps, settlement_kind);
 
@@ -9287,7 +9551,6 @@ impl CraftNexusContract {
             "expired_dispute_seller",
         );
 
-        let current_time = env.ledger().timestamp();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
@@ -9298,7 +9561,7 @@ impl CraftNexusContract {
                 seller: escrow.seller.clone(),
                 amount: escrow.amount,
                 token: escrow.token.clone(),
-                timestamp: current_time,
+                timestamp: env.ledger().timestamp(),
             },
         );
 
@@ -9724,6 +9987,10 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&min_stake.to_be_bytes());
+        Self::gate_admin_mutation(&env, "set_min_stake_required", payload)?;
+
         let mut config = Self::get_platform_config_internal(&env);
         config.min_stake_required = min_stake;
         env.storage()
@@ -9744,6 +10011,10 @@ impl CraftNexusContract {
         if cooldown_seconds < MIN_WASM_UPGRADE_COOLDOWN {
             return Err(Error::UpgradeCooldownTooShort);
         }
+
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&cooldown_seconds.to_be_bytes());
+        Self::gate_admin_mutation(&env, "set_wasm_upgrade_cooldown", payload)?;
 
         let mut config = Self::get_platform_config_internal(&env);
         let old_value = config.wasm_upgrade_cooldown;
@@ -9771,6 +10042,10 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&duration_seconds.to_be_bytes());
+        Self::gate_admin_mutation(&env, "set_max_dispute_duration", payload)?;
+
         let mut config = Self::get_platform_config_internal(&env);
         let old_value = config.max_dispute_duration;
         config.max_dispute_duration = duration_seconds;
@@ -9796,6 +10071,10 @@ impl CraftNexusContract {
     pub fn set_stake_cooldown(env: Env, cooldown_seconds: u32) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
+
+        let mut payload = Bytes::new(&env);
+        payload.extend_from_slice(&cooldown_seconds.to_be_bytes());
+        Self::gate_admin_mutation(&env, "set_stake_cooldown", payload)?;
 
         let mut config = Self::get_platform_config_internal(&env);
         let old_value = config.stake_cooldown;
@@ -9987,6 +10266,17 @@ impl CraftNexusContract {
         let snapshot: Escrow = snapshot_opt.unwrap();
 
         Self::assert_open_for_settlement(&env, &snapshot, order_id)?;
+        let config = Self::get_platform_config_internal(&env);
+        // After the max-dispute deadline the only remaining settlement path is
+        // `resolve_expired_dispute` (#1055).
+        let initiated_at = Self::dispute_clock(&snapshot)?;
+        if time_policy::is_window_elapsed(
+            env.ledger().timestamp(),
+            initiated_at,
+            config.max_dispute_duration as u64,
+        ) {
+            return Err(Error::ArbitratorDeadlineExceeded);
+        }
 
         let proposal =
             Self::load_partial_refund_proposal(&env, order_id).ok_or(Error::ProposalNotFound)?;
@@ -10002,12 +10292,11 @@ impl CraftNexusContract {
             return Err(Error::Unauthorized);
         }
         let operation_id = Self::onboarding_operation_id(&env, b"accept_partial_refund:", order_id);
-        Self::authorize_onboarding_state(&env, &escrow.buyer, operation_id.clone(), UserRole::Buyer);
-        Self::authorize_onboarding_state(&env, &escrow.seller, operation_id, UserRole::Artisan);
+        Self::authorize_onboarding_state(&env, &snapshot.buyer, operation_id.clone(), UserRole::Buyer);
+        Self::authorize_onboarding_state(&env, &snapshot.seller, operation_id, UserRole::Artisan);
 
         let (_seller_gross, allocation) =
             Self::validate_partial_refund_solvency(&env, &snapshot, proposal.refund_amount)?;
-        let config = Self::get_platform_config_internal(&env);
 
         let escrow = Self::claim_disputed_settlement(&env, order_id)?;
         let escrow = Self::commit_resolved_escrow(

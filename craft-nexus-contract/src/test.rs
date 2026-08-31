@@ -2565,9 +2565,12 @@ fn test_duplicate_approval_returns_already_approved() {
 
     client.propose_upgrade_wasm(&admin, &hash);
     let result = client.try_propose_upgrade_wasm(&admin, &hash);
-    assert!(result.is_err());
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::AlreadyApproved)));
+    assert_eq!(result, Err(Ok(Error::AlreadyApproved)));
 
+    // Canonical keyed slot and list both record a single approval.
+    assert!(client.has_upgrade_approval(&0, &admin));
+    assert!(!client.has_upgrade_approval(&0, &signer2));
     // Nonce is 0; admin approved once; signer2 has not approved yet.
     assert_eq!(client.get_upgrade_approvals(&0).len(), 1);
     assert!(client.get_upgrade_proposal().is_none());
@@ -2598,6 +2601,64 @@ fn test_unique_signers_only_reach_threshold() {
     let proposal = client.get_upgrade_proposal().expect("proposal missing");
     assert_eq!(proposal.wasm_hash, hash);
     assert_eq!(proposal.proposed_by, signer2);
+}
+
+#[test]
+fn test_upgrade_approval_event_identifies_revision_and_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&2);
+
+    let hash = BytesN::from_array(&env, &[9u8; 32]);
+    client.propose_upgrade_wasm(&admin, &hash);
+
+    let events = env.events().all();
+    let approval = events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.1 == vec![
+                &env,
+                Symbol::new(&env, "wasm_upgrade").into_val(&env),
+                Symbol::new(&env, "UPG_APPR").into_val(&env),
+            ]
+        })
+        .expect("missing UPG_APPR event");
+    let payload: UpgradeApprovalEvent = approval.2.try_into_val(&env).unwrap();
+    assert_eq!(payload.nonce, 0);
+    assert_eq!(payload.signer, admin);
+    assert_eq!(payload.wasm_hash, hash);
+    assert_eq!(payload.approval_count, 1);
+}
+
+#[test]
+fn test_upgrade_approval_count_cannot_exceed_signer_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&2);
+
+    let hash = BytesN::from_array(&env, &[11u8; 32]);
+    client.propose_upgrade_wasm(&admin, &hash);
+    client.propose_upgrade_wasm(&signer2, &hash);
+
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 0);
+    assert!(client.get_upgrade_proposal().is_some());
+    let result = client.try_propose_upgrade_wasm(&admin, &hash);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -6727,6 +6788,10 @@ fn test_arbitrator_resolution_blocked_after_max_dispute_duration() {
     assert_panic_contract_error(
         client.try_resolve_dispute_partial(&1, &400, &admin),
         Error::ArbitratorDeadlineExceeded,
+    );
+    assert_eq!(
+        client.try_accept_partial_refund(&1).unwrap_err(),
+        Ok(Error::ArbitratorDeadlineExceeded)
     );
 
     client.resolve_expired_dispute(&1);
