@@ -672,12 +672,20 @@ pub enum DataKey {
     UsedEvidenceHash(BytesN<32>),
     /// Escalation record for a dispute (#941)
     DisputeEscalation(u32),
+    /// Assignment snapshot for a disputed escrow.
+    DisputeAssignment(u32),
+    /// Monotonic revision of the active arbitrator assignment.
+    ArbitratorAssignmentRevision,
     /// Configurable dispute escalation window in seconds (#941)
     DisputeEscalationWindow,
     /// Counter for rate-limited calls per address per window (#943)
     RateLimitCount(Address, u64),
     /// Platform rate limit configuration (max_calls, window) (#943)
     RateLimitConfig,
+    /// Caller-scoped idempotency record keyed by (caller, operation_key) (#1025)
+    IdempotencyRecord(Address, BytesN<32>),
+}
+
     /// Current emergency operation in flight (only one at a time) (#1072)
     CurrentEmergencyOperation,
     /// Historical log of completed/failed emergency operations (#1072)
@@ -696,6 +704,20 @@ pub enum DataKey {
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 #[repr(u32)]
+pub enum IdempotencyOp {
+    CreateEscrow = 1,
+    ReleaseFunds = 2,
+    Refund = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct IdempotencyRecord {
+    pub op: IdempotencyOp,
+    pub order_id: u32,
+    pub params_hash: BytesN<32>,
+    pub created_at: u64,
 pub enum EmergencyOpKind {
     /// Admin account recovery via fallback admin
     AdminRecovery = 0,
@@ -1721,6 +1743,7 @@ pub struct DisputeEvidence {
     pub id: u64,
     pub order_id: u32,
     pub dispute_session_id: u64,
+    pub assignment_revision: u64,
     pub submitter: Address,
     pub evidence_uri: String,
     pub parent_evidence_id: Option<u64>,
@@ -1735,8 +1758,32 @@ pub struct DisputeEvidence {
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub struct DisputeEscalationRecord {
     pub order_id: u32,
+    pub assignment_revision: u64,
     pub escalated_by: Address,
     pub escalated_at: u64,
+}
+
+/// The arbitrator and revision assigned to one active dispute.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct DisputeAssignment {
+    pub order_id: u32,
+    pub arbitrator: Address,
+    pub revision: u64,
+    pub assigned_at: u64,
+}
+
+/// Emitted when an active dispute is explicitly moved to a new assignment.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct DisputeAssignmentChangedEvent {
+    pub order_id: u32,
+    pub old_revision: u64,
+    pub new_revision: u64,
+    pub arbitrator: Address,
+    pub changed_at: u64,
 }
 
 /// Configuration for sensitive action rate limiting (#943).
@@ -1780,6 +1827,7 @@ pub enum SettlementPath {
 pub struct SettlementReceipt {
     pub order_id: u32,
     pub path: SettlementPath,
+    pub assignment_revision: u64,
     pub executed_at: u64,
     pub proposal_nonce: u64,
 }
@@ -2795,6 +2843,71 @@ impl CraftNexusContract {
         }
     }
 
+    /// Extend the TTL of a temporary storage entry using standardized values.
+    #[inline(always)]
+    fn extend_temporary(env: &Env, key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
+        env.storage()
+            .temporary()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_EXTENSION);
+    }
+
+    /// Check and validate an idempotency key if provided (#1025).
+    ///
+    /// If the key has already been used for this caller:
+    /// - If the recorded operation and parameters match, returns `Ok(Some(order_id))`.
+    /// - If the operation or parameters do not match, returns `Err(Error::IdempotencyMismatch)`.
+    /// If the key is fresh or None, returns `Ok(None)`.
+    fn check_idempotency(
+        env: &Env,
+        caller: &Address,
+        idempotency_key: &Option<BytesN<32>>,
+        expected_op: IdempotencyOp,
+        params_hash: &BytesN<32>,
+    ) -> Result<Option<u32>, Error> {
+        let key_bytes = match idempotency_key {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let storage_key = DataKey::IdempotencyRecord(caller.clone(), key_bytes.clone());
+        if let Some(record) = env
+            .storage()
+            .temporary()
+            .get::<_, IdempotencyRecord>(&storage_key)
+        {
+            Self::extend_temporary(env, &storage_key);
+            if record.op == expected_op && &record.params_hash == params_hash {
+                return Ok(Some(record.order_id));
+            } else {
+                return Err(Error::IdempotencyMismatch);
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Record an idempotency key after successful operation execution (#1025).
+    fn record_idempotency(
+        env: &Env,
+        caller: &Address,
+        idempotency_key: &Option<BytesN<32>>,
+        op: IdempotencyOp,
+        order_id: u32,
+        params_hash: BytesN<32>,
+    ) {
+        if let Some(key_bytes) = idempotency_key {
+            let storage_key = DataKey::IdempotencyRecord(caller.clone(), key_bytes.clone());
+            let record = IdempotencyRecord {
+                op,
+                order_id,
+                params_hash,
+                created_at: env.ledger().timestamp(),
+            };
+            env.storage().temporary().set(&storage_key, &record);
+            Self::extend_temporary(env, &storage_key);
+        }
+    }
+
     #[inline(always)]
     fn get_whitelist_count(env: &Env) -> u32 {
         let count_key = DataKey::WhitelistedTokenCount;
@@ -3802,6 +3915,10 @@ impl CraftNexusContract {
             .instance()
             .set(&DataKey::PlatformConfig, &config);
 
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorAssignmentRevision, &1u64);
+
         if let Err(e) = Self::set_fallback_admin(&env, admin.clone()) {
             env.panic_with_error(e);
         }
@@ -4519,6 +4636,85 @@ impl CraftNexusContract {
         Ok(())
     }
 
+    /// Create a new escrow with an optional idempotency key (#1025).
+    ///
+    /// If an idempotency key is provided and was already used by this caller with the same
+    /// parameters, the existing escrow is returned without duplicate creation.
+    /// If the key was used with different parameters or by a different operation,
+    /// returns `Error::IdempotencyMismatch`.
+    pub fn create_escrow_idempotent(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        amount: i128,
+        order_id: u32,
+        release_window: Option<u32>,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> Result<Escrow, Error> {
+        let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
+        buyer.require_auth();
+
+        let window = release_window.unwrap_or(604800u32);
+        // Compute parameters hash for idempotency checking
+        let mut hasher_bytes = Bytes::new(&env);
+        hasher_bytes.append(&seller.clone().to_xdr(&env));
+        hasher_bytes.append(&token.clone().to_xdr(&env));
+        hasher_bytes.append(&amount.to_xdr(&env));
+        hasher_bytes.append(&order_id.to_xdr(&env));
+        hasher_bytes.append(&window.to_xdr(&env));
+        let params_hash: BytesN<32> = env.crypto().sha256(&hasher_bytes).into();
+
+        if let Some(existing_order_id) = Self::check_idempotency(
+            &env,
+            &buyer,
+            &idempotency_key,
+            IdempotencyOp::CreateEscrow,
+            &params_hash,
+        )? {
+            return Ok(Self::get_stored_escrow(&env, existing_order_id));
+        }
+
+        let escrow = Self::create_escrow_internal(
+            &env,
+            buyer.clone(),
+            seller,
+            token,
+            amount,
+            order_id,
+            release_window,
+            None,
+            None,
+            None,
+        );
+
+        Self::record_idempotency(
+            &env,
+            &buyer,
+            &idempotency_key,
+            IdempotencyOp::CreateEscrow,
+            order_id,
+            params_hash,
+        );
+
+        Ok(escrow)
+    }
+
+    /// Query an idempotency record for a caller and key (#1025).
+    pub fn get_idempotency_record(
+        env: Env,
+        caller: Address,
+        key: BytesN<32>,
+    ) -> Option<IdempotencyRecord> {
+        let storage_key = DataKey::IdempotencyRecord(caller, key);
+        let record = env.storage().temporary().get(&storage_key);
+        if record.is_some() {
+            Self::extend_temporary(&env, &storage_key);
+        }
+        record
+    }
+
     /// Create a new escrow for an order
     ///
     /// # Arguments
@@ -4568,6 +4764,32 @@ impl CraftNexusContract {
         Self::check_not_paused(&env);
         buyer.require_auth();
 
+        Self::create_escrow_internal(
+            &env,
+            buyer,
+            seller,
+            token,
+            amount,
+            order_id,
+            release_window,
+            ipfs_hash,
+            metadata_hash,
+            service_agreement_hash,
+        )
+    }
+
+    fn create_escrow_internal(
+        env: &Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        amount: i128,
+        order_id: u32,
+        release_window: Option<u32>,
+        ipfs_hash: Option<String>,
+        metadata_hash: Option<Bytes>,
+        service_agreement_hash: Option<Bytes>,
+    ) -> Escrow {
         // Issue #1057: Block deactivated accounts from creating escrows
         Self::assert_account_active(&env, &buyer);
 
@@ -4576,7 +4798,7 @@ impl CraftNexusContract {
         Self::authorize_onboarding_state(&env, &seller, operation_id, UserRole::Artisan);
 
         // Validate amount is positive and above minimum
-        if let Err(e) = Self::check_min_amount(&env, token.clone(), amount) {
+        if let Err(e) = Self::check_min_amount(env, token.clone(), amount) {
             env.panic_with_error(e);
         }
 
@@ -4586,10 +4808,10 @@ impl CraftNexusContract {
         }
 
         // Validate token is whitelisted (#103)
-        Self::check_token_whitelisted(&env, &token);
+        Self::check_token_whitelisted(env, &token);
 
         // Check artisan (seller) stake requirement (Issue #99)
-        let config = Self::get_platform_config_internal(&env);
+        let config = Self::get_platform_config_internal(env);
         if config.min_stake_required > 0 {
             Self::migrate_legacy_artisan_stake(env.clone(), seller.clone());
             let artisan_stake: i128 = env
@@ -4608,7 +4830,7 @@ impl CraftNexusContract {
 
         // Validate release window bounds
         let min_window = config.min_release_window;
-        let max_window = Self::get_max_release_window(&env);
+        let max_window = Self::get_max_release_window(env);
 
         if window < min_window {
             env.panic_with_error(crate::Error::ReleaseWindowTooShort);
@@ -4617,7 +4839,7 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::ReleaseWindowTooLong);
         }
 
-        Self::validate_onboarding_state(&env, &buyer, &seller);
+        Self::validate_onboarding_state(env, &buyer, &seller);
 
         let created_at_u64 = env.ledger().timestamp();
         assert!(
@@ -4625,13 +4847,13 @@ impl CraftNexusContract {
             "Ledger timestamp overflow"
         );
         let created_at = created_at_u64 as u32;
-        Self::validate_optional_ipfs_hash(&env, &ipfs_hash);
-        Self::validate_optional_metadata_hash(&env, &metadata_hash);
-        Self::validate_optional_service_agreement_hash(&env, &service_agreement_hash);
+        Self::validate_optional_ipfs_hash(env, &ipfs_hash);
+        Self::validate_optional_metadata_hash(env, &metadata_hash);
+        Self::validate_optional_service_agreement_hash(env, &service_agreement_hash);
 
         // Reject duplicate escrow identifiers (#1027): a retry or a conflicting
         // external reference must never overwrite an existing escrow.
-        Self::assert_escrow_not_exists(&env, order_id);
+        Self::assert_escrow_not_exists(env, order_id);
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -4654,15 +4876,15 @@ impl CraftNexusContract {
         };
 
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
-        Self::extend_persistent(&env, &(ESCROW, order_id));
+        Self::extend_persistent(env, &(ESCROW, order_id));
 
         // Track active escrows
-        Self::update_active_obligations(&env, &buyer, 1);
-        Self::update_active_obligations(&env, &seller, 1);
+        Self::update_active_obligations(env, &buyer, 1);
+        Self::update_active_obligations(env, &seller, 1);
 
         // Update global escrow index for off-chain enumeration using atomic function
         // This ensures AllEscrowIds and EscrowCount always remain in sync (Issue #226)
-        Self::update_escrow_indices_atomic(&env, order_id);
+        Self::update_escrow_indices_atomic(env, order_id);
 
         // Update buyer's escrow list using indexed storage (scalable approach)
         let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
@@ -4704,24 +4926,24 @@ impl CraftNexusContract {
             .set(&seller_count_key, &new_seller_count);
         Self::extend_persistent(&env, &seller_count_key);
 
-        Self::safe_update_active_contracts(&env, buyer.clone(), 1);
-        Self::safe_update_active_contracts(&env, seller.clone(), 1);
+        Self::safe_update_active_contracts(env, buyer.clone(), 1);
+        Self::safe_update_active_contracts(env, seller.clone(), 1);
 
         // Commit locked accounting before the external token interaction.
-        Self::update_total_locked(&env, &token, amount);
+        Self::update_total_locked(env, &token, amount);
         Self::transfer_tokens_and_record_audit(
-            &env,
+            env,
             &token,
             &buyer,
             &env.current_contract_address(),
             amount,
             &buyer,
-            Symbol::new(&env, "escrow_funded"),
+            Symbol::new(env, "escrow_funded"),
             -amount,
         );
 
         Self::emit_escrow_created(
-            &env,
+            env,
             EscrowEvent {
                 schema_version: 1,
                 escrow_id: order_id as u64,
@@ -5719,6 +5941,41 @@ impl CraftNexusContract {
         Ok(())
     }
 
+    fn current_arbitrator_assignment(env: &Env) -> (Address, u64) {
+        let config = Self::get_platform_config_internal(env);
+        let revision = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorAssignmentRevision)
+            .unwrap_or(1u64);
+        (config.arbitrator, revision)
+    }
+
+    fn get_dispute_assignment_internal(env: &Env, order_id: u32) -> DisputeAssignment {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeAssignment(order_id))
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::InvalidEscrowState))
+    }
+
+    fn assert_active_dispute_assignment(
+        env: &Env,
+        order_id: u32,
+        authorized_address: Option<&Address>,
+    ) -> DisputeAssignment {
+        let assignment = Self::get_dispute_assignment_internal(env, order_id);
+        let (arbitrator, revision) = Self::current_arbitrator_assignment(env);
+        if assignment.revision != revision || assignment.arbitrator != arbitrator {
+            env.panic_with_error(crate::Error::InvalidEscrowState);
+        }
+        if let Some(address) = authorized_address {
+            if *address != assignment.arbitrator {
+                env.panic_with_error(crate::Error::Unauthorized);
+            }
+        }
+        assignment
+    }
+
     fn is_escrow_party(escrow: &Escrow, caller: &Address) -> bool {
         *caller == escrow.buyer || *caller == escrow.seller
     }
@@ -5833,11 +6090,18 @@ impl CraftNexusContract {
         proposal_nonce: u64,
     ) {
         let key = Self::settlement_receipt_key(order_id);
+        let assignment_revision = env
+            .storage()
+            .persistent()
+            .get::<_, DisputeAssignment>(&DataKey::DisputeAssignment(order_id))
+            .map(|assignment| assignment.revision)
+            .unwrap_or(0);
         env.storage().persistent().set(
             &key,
             &SettlementReceipt {
                 order_id,
                 path,
+                assignment_revision,
                 executed_at: env.ledger().timestamp(),
                 proposal_nonce,
             },
@@ -6230,6 +6494,54 @@ impl CraftNexusContract {
         total_fees
     }
 
+    /// Release funds to seller with platform fee deduction and optional idempotency key (#1025).
+    ///
+    /// If an idempotency key is provided and was already used by this buyer for this order,
+    /// returns `Ok(())` without executing duplicate token transfers or fee deductions.
+    /// If used with different parameters or by a different operation/caller, returns `Error::IdempotencyMismatch`.
+    pub fn release_funds_idempotent(
+        env: Env,
+        order_id: u32,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
+        let escrow_for_auth = Self::get_stored_escrow(&env, order_id);
+
+        // Only buyer can release funds
+        escrow_for_auth.buyer.require_auth();
+
+        let mut hasher_bytes = Bytes::new(&env);
+        hasher_bytes.append(&order_id.to_xdr(&env));
+        let params_hash: BytesN<32> = env.crypto().sha256(&hasher_bytes).into();
+
+        if let Some(existing_order_id) = Self::check_idempotency(
+            &env,
+            &escrow_for_auth.buyer,
+            &idempotency_key,
+            IdempotencyOp::ReleaseFunds,
+            &params_hash,
+        )? {
+            if existing_order_id == order_id {
+                return Ok(());
+            } else {
+                return Err(Error::IdempotencyMismatch);
+            }
+        }
+
+        Self::release_funds_internal(&env, order_id, &escrow_for_auth)?;
+
+        Self::record_idempotency(
+            &env,
+            &escrow_for_auth.buyer,
+            &idempotency_key,
+            IdempotencyOp::ReleaseFunds,
+            order_id,
+            params_hash,
+        );
+
+        Ok(())
+    }
+
     /// Release funds to seller with platform fee deduction
     ///
     /// # Arguments
@@ -6248,17 +6560,25 @@ impl CraftNexusContract {
             UserRole::Buyer,
         );
 
+        Self::release_funds_internal(&env, order_id, &escrow_for_auth)
+            .unwrap_or_else(|e| env.panic_with_error(e));
+    }
+
+    fn release_funds_internal(
+        env: &Env,
+        order_id: u32,
+        _escrow_for_auth: &Escrow,
+    ) -> Result<(), Error> {
         let mut escrow =
-            Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::ReleasePending)
-                .unwrap_or_else(|e| env.panic_with_error(e));
+            Self::claim_active_escrow_transition(env, order_id, EscrowStatus::ReleasePending)?;
 
         // Get platform config
-        let config = Self::get_platform_config_internal(&env);
+        let config = Self::get_platform_config_internal(env);
 
         // Deterministic fee allocation via the central FeePolicy engine.
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
         let allocation = Self::compute_fee_allocation(
-            &env,
+            env,
             escrow.amount,
             fee_bps,
             SettlementKind::ReleaseFunds,
@@ -6269,19 +6589,19 @@ impl CraftNexusContract {
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
 
         // Decrement active counts
-        Self::update_active_obligations(&env, &escrow.buyer, -1);
-        Self::update_active_obligations(&env, &escrow.seller, -1);
+        Self::update_active_obligations(env, &escrow.buyer, -1);
+        Self::update_active_obligations(env, &escrow.seller, -1);
 
-        Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
-        Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+        Self::safe_update_active_contracts(env, escrow.buyer.clone(), -1);
+        Self::safe_update_active_contracts(env, escrow.seller.clone(), -1);
 
         // Reserve accounting is part of the effects phase.
-        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+        Self::update_total_locked(env, &escrow.token, -escrow.amount);
 
         // Transfer platform fee to platform wallet
         if allocation.platform_fee > 0 {
             Self::transfer_platform_fee(
-                &env,
+                env,
                 &escrow.token,
                 &config.platform_wallet,
                 allocation.platform_fee,
@@ -6290,18 +6610,18 @@ impl CraftNexusContract {
 
         // Transfer net funds to seller and record audit
         Self::transfer_tokens_and_record_audit(
-            &env,
+            env,
             &escrow.token,
             &env.current_contract_address(),
             &escrow.seller,
             allocation.seller_amount,
             &escrow.seller,
-            Symbol::new(&env, "escrow_released"),
+            Symbol::new(env, "escrow_released"),
             allocation.seller_amount,
         );
 
         Self::emit_escrow_created(
-            &env,
+            env,
             EscrowEvent {
                 schema_version: 1,
                 escrow_id: order_id as u64,
@@ -6314,10 +6634,10 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events â€” decoupled from onboarding contract (#211)
+        // Emit reputation update events — decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.seller.clone(),
                 successful_delta: 1,
@@ -6329,7 +6649,7 @@ impl CraftNexusContract {
             },
         );
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.buyer.clone(),
                 successful_delta: 1,
@@ -6340,6 +6660,8 @@ impl CraftNexusContract {
                 timestamp: ts,
             },
         );
+
+        Ok(())
     }
 
     /// Auto-release funds after release window (seller can call)
@@ -7150,6 +7472,54 @@ impl CraftNexusContract {
         }
     }
 
+    /// Refund funds to buyer with an optional idempotency key (admin only) (#1025).
+    ///
+    /// If an idempotency key is provided and was already used by the admin for this escrow,
+    /// returns `Ok(())` without executing duplicate token transfers or state updates.
+    /// If used with different parameters or by a different operation/caller, returns `Error::IdempotencyMismatch`.
+    pub fn refund_idempotent(
+        env: Env,
+        escrow_id: u64,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let order_id = escrow_id as u32;
+
+        let mut hasher_bytes = Bytes::new(&env);
+        hasher_bytes.append(&escrow_id.to_xdr(&env));
+        let params_hash: BytesN<32> = env.crypto().sha256(&hasher_bytes).into();
+
+        if let Some(existing_order_id) = Self::check_idempotency(
+            &env,
+            &admin,
+            &idempotency_key,
+            IdempotencyOp::Refund,
+            &params_hash,
+        )? {
+            if existing_order_id == order_id {
+                return Ok(());
+            } else {
+                return Err(Error::IdempotencyMismatch);
+            }
+        }
+
+        Self::refund_internal(&env, escrow_id)?;
+
+        Self::record_idempotency(
+            &env,
+            &admin,
+            &idempotency_key,
+            IdempotencyOp::Refund,
+            order_id,
+            params_hash,
+        );
+
+        Ok(())
+    }
+
     /// Refund funds to buyer (admin only)
     ///
     /// # Arguments
@@ -7159,6 +7529,10 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
+        Self::refund_internal(&env, escrow_id)
+    }
+
+    fn refund_internal(env: &Env, escrow_id: u64) -> Result<(), Error> {
         let order_id = escrow_id as u32;
         let mut escrow =
             Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::RefundPending)?;
@@ -7168,7 +7542,7 @@ impl CraftNexusContract {
 
         // Deterministic fee allocation via the central FeePolicy engine.
         let allocation =
-            Self::compute_fee_allocation(&env, escrow.amount, 0, SettlementKind::FullRefundNoFee);
+            Self::compute_fee_allocation(env, escrow.amount, 0, SettlementKind::FullRefundNoFee);
 
         // CEI: persist the Refunded state before any external token transfer.
         escrow.status = EscrowStatus::Refunded;
@@ -7186,18 +7560,18 @@ impl CraftNexusContract {
 
         // Refund to buyer and record audit
         Self::transfer_tokens_and_record_audit(
-            &env,
+            env,
             &escrow.token,
             &env.current_contract_address(),
             &escrow.buyer,
             allocation.buyer_amount,
             &escrow.buyer,
-            Symbol::new(&env, "refund"),
+            Symbol::new(env, "refund"),
             allocation.buyer_amount,
         );
 
         Self::emit_escrow_created(
-            &env,
+            env,
             EscrowEvent {
                 schema_version: 1,
                 escrow_id,
@@ -7210,10 +7584,10 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events â€” decoupled from onboarding contract (#211)
+        // Emit reputation update events — decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.buyer.clone(),
                 successful_delta: 1,
@@ -7225,7 +7599,7 @@ impl CraftNexusContract {
             },
         );
         Self::emit_reputation_update(
-            &env,
+            env,
             ReputationUpdateEvent {
                 address: escrow.seller.clone(),
                 successful_delta: 0,
@@ -7569,6 +7943,16 @@ impl CraftNexusContract {
                                                       // downstream timers (evidence window, escalation window, max duration).
         escrow.dispute_initiated_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        let (arbitrator, revision) = Self::current_arbitrator_assignment(&env);
+        env.storage().persistent().set(
+            &DataKey::DisputeAssignment(order_id),
+            &DisputeAssignment {
+                order_id,
+                arbitrator,
+                revision,
+                assigned_at: env.ledger().timestamp(),
+            },
+        );
         // Increment the global active dispute counter used by emergency-op
         // guards (admin recovery, upgrade proposals) to detect unsafe conditions.
         Self::update_active_dispute_count(&env, 1);
@@ -7690,6 +8074,7 @@ impl CraftNexusContract {
         let snapshot = Self::get_stored_escrow(&env, order_id);
         Self::assert_open_for_settlement(&env, &snapshot, order_id)
             .unwrap_or_else(|e| env.panic_with_error(e));
+        Self::assert_active_dispute_assignment(&env, order_id, None);
         Self::assert_arbitrator_resolution_window(&env, &snapshot, &config)
             .unwrap_or_else(|e| env.panic_with_error(e));
 
@@ -7826,6 +8211,8 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::NotInDispute);
         }
 
+        let assignment = Self::assert_active_dispute_assignment(&env, order_id, None);
+
         if !(submitter == escrow.buyer || submitter == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
         }
@@ -7862,6 +8249,7 @@ impl CraftNexusContract {
             id,
             order_id,
             dispute_session_id,
+            assignment_revision: assignment.revision,
             submitter,
             evidence_uri,
             parent_evidence_id: None,
@@ -7890,6 +8278,8 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::NotInDispute);
         }
 
+        let assignment = Self::assert_active_dispute_assignment(&env, order_id, None);
+
         if !(submitter == escrow.buyer || submitter == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
         }
@@ -7909,7 +8299,10 @@ impl CraftNexusContract {
         // Validate parent evidence ID exists in current dispute evidence log
         let mut parent_found = false;
         for item in log.iter() {
-            if item.id == parent_evidence_id && item.dispute_session_id == dispute_session_id {
+            if item.id == parent_evidence_id
+                && item.dispute_session_id == dispute_session_id
+                && item.assignment_revision == assignment.revision
+            {
                 parent_found = true;
                 break;
             }
@@ -7938,6 +8331,7 @@ impl CraftNexusContract {
             id,
             order_id,
             dispute_session_id,
+            assignment_revision: assignment.revision,
             submitter,
             evidence_uri,
             parent_evidence_id: Some(parent_evidence_id),
@@ -7986,10 +8380,14 @@ impl CraftNexusContract {
         let all_evidence = Self::get_evidence(env.clone(), order_id);
         let mut valid_log = Vec::new(&env);
         let current_time = env.ledger().timestamp();
+        let assignment = Self::get_dispute_assignment_internal(&env, order_id);
 
         for item in all_evidence.into_iter() {
             // Time policy: evidence is valid while now < expires_at (window active)
-            if !item.is_invalidated && time_policy::is_deadline_pending(current_time, item.expires_at) {
+            if !item.is_invalidated
+                && item.assignment_revision == assignment.revision
+                && time_policy::is_deadline_pending(current_time, item.expires_at)
+            {
                 valid_log.push_back(item);
             }
         }
@@ -8004,6 +8402,8 @@ impl CraftNexusContract {
         if escrow.status != EscrowStatus::Disputed {
             env.panic_with_error(crate::Error::NotInDispute);
         }
+
+        let assignment = Self::assert_active_dispute_assignment(&env, order_id, None);
 
         if !(caller == escrow.buyer || caller == escrow.seller) {
             env.panic_with_error(crate::Error::Unauthorized);
@@ -8030,6 +8430,7 @@ impl CraftNexusContract {
 
         let record = DisputeEscalationRecord {
             order_id,
+            assignment_revision: assignment.revision,
             escalated_by: caller,
             escalated_at: current_time,
         };
@@ -8044,6 +8445,46 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .get(&DataKey::DisputeEscalation(order_id))
+    }
+
+    /// Return the assignment snapshot for a disputed order.
+    pub fn get_dispute_assignment(env: Env, order_id: u32) -> Option<DisputeAssignment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeAssignment(order_id))
+    }
+
+    /// Reassign an open dispute to the current arbitrator assignment.
+    pub fn reassign_dispute(env: Env, order_id: u32) {
+        let config = Self::get_platform_config_internal(&env);
+        config.admin.require_auth();
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            env.panic_with_error(crate::Error::NotInDispute);
+        }
+
+        let old_assignment = Self::get_dispute_assignment_internal(&env, order_id);
+        let (arbitrator, revision) = Self::current_arbitrator_assignment(&env);
+        let changed_at = env.ledger().timestamp();
+        let new_assignment = DisputeAssignment {
+            order_id,
+            arbitrator: arbitrator.clone(),
+            revision,
+            assigned_at: changed_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeAssignment(order_id), &new_assignment);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_assignment_changed"), order_id as u64),
+            DisputeAssignmentChangedEvent {
+                order_id,
+                old_revision: old_assignment.revision,
+                new_revision: revision,
+                arbitrator,
+                changed_at,
+            },
+        );
     }
 
     /// Set the dispute escalation window (admin only) (#941).
@@ -8109,6 +8550,7 @@ impl CraftNexusContract {
         let snapshot = Self::get_stored_escrow(&env, order_id);
         Self::assert_open_for_settlement(&env, &snapshot, order_id)
             .unwrap_or_else(|e| env.panic_with_error(e));
+        Self::assert_active_dispute_assignment(&env, order_id, None);
         Self::assert_arbitrator_resolution_window(&env, &snapshot, &config)
             .unwrap_or_else(|e| env.panic_with_error(e));
 
@@ -8190,6 +8632,48 @@ impl CraftNexusContract {
                 timestamp: ts,
             },
         );
+    }
+
+    /// Change the active arbitrator and advance the assignment revision.
+    /// Existing disputes remain financially intact but all actions bound to
+    /// their previous assignment are rejected until an admin explicitly
+    /// reassigns each affected dispute.
+    pub fn update_arbitrator(env: Env, new_arbitrator: Address) {
+        let mut config = Self::get_platform_config_internal(&env);
+        config.admin.require_auth();
+
+        let old_arbitrator = config.arbitrator.clone();
+        let old_revision = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorAssignmentRevision)
+            .unwrap_or(1u64);
+        let new_revision = old_revision
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::InvalidEscrowState));
+
+        config.arbitrator = new_arbitrator.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorAssignmentRevision, &new_revision);
+
+        Self::emit_config_updated(
+            &env,
+            "arbitrator",
+            ConfigValue::Address(old_arbitrator),
+            ConfigValue::Address(new_arbitrator),
+        );
+    }
+
+    /// Return the active arbitrator assignment revision.
+    pub fn get_arbitrator_assignment_revision(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArbitratorAssignmentRevision)
+            .unwrap_or(1u64)
     }
 
     /// Update platform fee percentage (admin only)
@@ -9210,10 +9694,17 @@ impl CraftNexusContract {
         }
     }
 
-    /// View: check if contract is paused.
+    /// Public read-only query for the platform pause state.
+    ///
+    /// This intentionally reads the same `PlatformConfig::is_paused` field used
+    /// by write guards. An uninitialized contract is active by default, matching
+    /// `check_not_paused`, which also permits read-only access before setup.
     pub fn is_paused(env: Env) -> bool {
-        let config = Self::get_platform_config_internal(&env);
-        config.is_paused
+        env.storage()
+            .instance()
+            .get::<DataKey, PlatformConfig>(&DataKey::PlatformConfig)
+            .map(|config| config.is_paused)
+            .unwrap_or(false)
     }
 
     // â”€â”€ Tiered Artisan Fees (#98) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
