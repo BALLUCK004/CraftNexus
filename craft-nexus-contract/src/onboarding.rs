@@ -1044,6 +1044,11 @@ pub enum Error {
     AttestationReplay = 28,
     /// Volume accumulator overflowed
     VolumeOverflow = 33,
+    VolumeOverflow = 26,
+    /// Escrow count accumulator overflowed (#1028)
+    EscrowCountOverflow = 27,
+    /// Active contracts accumulator overflowed (#1028)
+    ActiveContractOverflow = 28,
     /// Attempt rate policy contains an unusable limit configuration (#1084)
     InvalidRateLimitPolicy = 34,
     /// Review decision does not match the current profile revision (#1086)
@@ -4133,10 +4138,25 @@ impl OnboardingContract {
 
         metrics.total_escrow_count = metrics
             .total_escrow_count
-            .saturating_add(escrow_count_delta);
+            .checked_add(escrow_count_delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::EscrowCountOverflow));
 
         // Normalize volume to 7 decimals (base decimal for auto-verification thresholds)
-        let normalized_delta = Self::normalize_token_amount(&env, volume_delta, &token_address);
+        let token_client = token::Client::new(&env, &token_address);
+        let token_decimals = token_client.decimals();
+        let base_decimals = 7u32;
+
+        let normalized_delta = if token_decimals < base_decimals {
+            let diff = base_decimals - token_decimals;
+            volume_delta
+                .checked_mul(10i128.pow(diff))
+                .unwrap_or_else(|| env.panic_with_error(Error::VolumeOverflow))
+        } else if token_decimals > base_decimals {
+            let diff = token_decimals - base_decimals;
+            volume_delta / 10i128.pow(diff)
+        } else {
+            volume_delta
+        };
 
         metrics.total_volume = metrics
             .total_volume
@@ -4207,7 +4227,9 @@ impl OnboardingContract {
         let current = stored.unwrap_or(0u32);
 
         let next = if delta > 0 {
-            current.saturating_add(delta as u32)
+            current
+                .checked_add(delta as u32)
+                .unwrap_or_else(|| env.panic_with_error(Error::ActiveContractOverflow))
         } else {
             let subtract = (-delta) as u32;
             if subtract > current {
