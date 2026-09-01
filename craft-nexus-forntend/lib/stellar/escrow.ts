@@ -85,6 +85,7 @@ export interface IEscrowService {
   refund(orderId: number, authorizedAddress: string): Promise<TransactionResult>;
   getEscrow(orderId: number): Promise<Escrow | null>;
   canAutoRelease(orderId: number): Promise<boolean>;
+  isPaused(): Promise<boolean>;
   getEscrowContractAddress(): string;
 }
 
@@ -585,6 +586,31 @@ export class EscrowService implements IEscrowService {
     } catch (error) {
       console.error("Failed to get escrow:", error);
       return null;
+    }
+  }
+
+  /**
+   * Query the public pause state used by the escrow write guards.
+   */
+  async isPaused(): Promise<boolean> {
+    if (this.mockMode || !this.contract) {
+      return false;
+    }
+
+    try {
+      const contractCall = this.contract.call("is_paused");
+
+      // The public query has no arguments and requires no wallet auth.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const simulation = await this.rpc.simulateTransaction(contractCall as any);
+      if ("error" in simulation || !simulation.result?.retval) {
+        return false;
+      }
+
+      return Boolean(scValToNative(simulation.result.retval));
+    } catch (error) {
+      console.error("Failed to query escrow pause state:", error);
+      return false;
     }
   }
 

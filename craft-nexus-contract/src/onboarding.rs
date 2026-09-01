@@ -87,7 +87,7 @@
 
 use crate::alloc::string::ToString;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env,
     Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
@@ -278,18 +278,10 @@ pub enum DataKey {
     PohRequiredForAutoVerify,
     /// Optional Proof-of-Humanity verifier address (#940)
     PohVerifier,
-    /// Count of currently active (non-deactivated) users
-    ActiveUserCount,
-    /// Monotonically increasing state version for a user profile — incremented
-    /// on role changes, verification transitions, deactivation, and reactivation
-    /// so downstream contracts can detect stale onboarding state.
-    UserStateVersion(Address),
-    /// Global onboard event counter
-    GlobalOnboardCount,
-    /// Global username-change event counter
-    GlobalUsernameChangeCount,
-    /// Global admin-action event counter
-    GlobalAdminActionCount,
+    /// Monotonic canonical onboarding state revision per user.
+    UserStateRevision(Address),
+    /// An operation binding already consumed by an escrow contract.
+    UsedAttestation(Address, Bytes),
 }
 
 /// User roles in the CraftNexus platform.
@@ -378,6 +370,23 @@ pub struct UserProfile {
     /// verification transitions, deactivation, and reactivation so downstream
     /// contracts can detect stale onboarding state.
     pub state_version: u32,
+}
+
+/// Coherent onboarding state proof for a single privileged marketplace operation.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct OnboardingAttestation {
+    pub account: Address,
+    pub profile_version: u32,
+    pub role: UserRole,
+    pub is_verified: bool,
+    pub status: ProfileStatus,
+    pub state_revision: u64,
+    pub ledger_sequence: u32,
+    pub operation_id: Bytes,
+    pub contract_instance: Address,
+    pub state_digest: BytesN<32>,
 }
 
 /// Flat persistent representation stored under [`DataKey::UserProfile`].
@@ -1019,8 +1028,18 @@ pub enum Error {
     PohCredentialExpired = 24,
     /// Cooldown period for manual verification request is still active (#940)
     VerificationCooldownActive = 25,
+    /// The onboarding state revision cannot be incremented further.
+    StateRevisionExhausted = 26,
+    /// An onboarding attestation is absent, stale, malformed, or inconsistent.
+    InvalidAttestation = 27,
+    /// An operation binding has already been consumed.
+    AttestationReplay = 28,
     /// Volume accumulator overflowed
     VolumeOverflow = 26,
+    /// Escrow count accumulator overflowed (#1028)
+    EscrowCountOverflow = 27,
+    /// Active contracts accumulator overflowed (#1028)
+    ActiveContractOverflow = 28,
     /// Attempt rate policy contains an unusable limit configuration (#1084)
     InvalidRateLimitPolicy = 27,
     /// Review decision does not match the current profile revision (#1086)
@@ -1031,6 +1050,8 @@ pub enum Error {
     InvalidReviewTransition = 30,
     /// Caller is not an authorized Sybil reviewer (#1086)
     UnauthorizedReviewer = 31,
+    /// Profile schema version is not supported by this contract (#1056)
+    UnsupportedProfileVersion = 32,
 }
 
 /// Cross-contract interface the onboarding contract uses to query the escrow
@@ -2226,6 +2247,68 @@ impl OnboardingContract {
     fn persist_public_user_profile(env: &Env, user: &Address, profile: &UserProfile) {
         Self::persist_stored_user_profile(env, user, &Self::public_to_stored(profile));
         Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
+        Self::bump_state_revision(env, user);
+    }
+
+    fn ensure_state_revision(env: &Env, user: &Address) {
+        let key = DataKey::UserStateRevision(user.clone());
+        if !env.storage().persistent().has(&key) {
+            env.storage().persistent().set(&key, &1u64);
+            Self::extend_persistent(env, &key);
+        }
+    }
+
+    fn bump_state_revision(env: &Env, user: &Address) {
+        let key = DataKey::UserStateRevision(user.clone());
+        let revision = env.storage().persistent().get::<_, u64>(&key).unwrap_or(0);
+        let next = revision
+            .checked_add(1)
+            .unwrap_or_else(|| env.panic_with_error(Error::StateRevisionExhausted));
+        env.storage().persistent().set(&key, &next);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn state_revision(env: &Env, user: &Address) -> u64 {
+        let key = DataKey::UserStateRevision(user.clone());
+        let revision = env.storage().persistent().get(&key).unwrap_or(1u64);
+        Self::extend_persistent_if_present(env, &key);
+        revision
+    }
+
+    fn attestation_digest(
+        env: &Env,
+        account: &Address,
+        profile_version: u32,
+        role: UserRole,
+        is_verified: bool,
+        status: ProfileStatus,
+        state_revision: u64,
+        ledger_sequence: u32,
+        operation_id: &Bytes,
+        contract_instance: &Address,
+    ) -> BytesN<32> {
+        let mut payload = Bytes::from_slice(env, b"CRAFTNEXUS_ONBOARDING_ATTESTATION_V1");
+        let account_string = account.to_string();
+        let mut account_bytes = [0u8; 64];
+        let account_len = account_string.len() as usize;
+        payload.extend_from_slice(&(account_len as u32).to_be_bytes());
+        account_string.copy_into_slice(&mut account_bytes[..account_len]);
+        payload.extend_from_slice(&account_bytes[..account_len]);
+        payload.extend_from_slice(&profile_version.to_be_bytes());
+        payload.push_back(role as u8);
+        payload.push_back(if is_verified { 1 } else { 0 });
+        payload.push_back(status as u8);
+        payload.extend_from_slice(&state_revision.to_be_bytes());
+        payload.extend_from_slice(&ledger_sequence.to_be_bytes());
+        payload.extend_from_slice(&(operation_id.len() as u32).to_be_bytes());
+        payload.append(operation_id);
+        let contract_string = contract_instance.to_string();
+        let mut contract_bytes = [0u8; 64];
+        let contract_len = contract_string.len() as usize;
+        payload.extend_from_slice(&(contract_len as u32).to_be_bytes());
+        contract_string.copy_into_slice(&mut contract_bytes[..contract_len]);
+        payload.extend_from_slice(&contract_bytes[..contract_len]);
+        env.crypto().sha256(&payload)
     }
 
     /// Ensure the reverse username index points at the canonical account.
@@ -2300,8 +2383,7 @@ impl OnboardingContract {
             status: ProfileStatus::Active,
         };
         Self::persist_stored_user_profile(env, user, &stored);
-        env.storage().persistent().set(&DataKey::UserStateVersion(user.clone()), &1u32);
-        Self::extend_persistent(env, &DataKey::UserStateVersion(user.clone()));
+        Self::ensure_state_revision(env, user);
         stored
     }
 
@@ -2328,6 +2410,10 @@ impl OnboardingContract {
 
         let mut profile =
             StoredUserProfile::try_from_val(env, &stored).expect("User profile storage corrupted");
+        
+        // Validate profile version is supported (#1056)
+        Self::assert_profile_version_supported(env, profile.version);
+        
         let mut changed = false;
         if profile.version < CURRENT_USER_PROFILE_VERSION {
             profile.version = CURRENT_USER_PROFILE_VERSION;
@@ -2339,6 +2425,7 @@ impl OnboardingContract {
         } else {
             Self::extend_persistent(env, &key);
         }
+        Self::ensure_state_revision(env, &user);
 
         Some((profile, changed))
     }
@@ -2352,6 +2439,24 @@ impl OnboardingContract {
     fn get_user_profile(env: &Env, user: Address) -> UserProfile {
         Self::try_get_user_profile(env, user)
             .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound))
+    }
+
+    /// Validate that a profile schema version is supported by this contract.
+    ///
+    /// Rejects versions > CURRENT_USER_PROFILE_VERSION (unsupported future versions,
+    /// likely indicating corrupted data or a version mismatch). This prevents
+    /// silently misinterpreting unknown-version profiles using the latest
+    /// interpretation logic, which is the core bug Issue #1056 aims to fix.
+    ///
+    /// # Arguments
+    /// - `version`: The profile schema version to validate
+    ///
+    /// # Panics
+    /// With `Error::UnsupportedProfileVersion` if version > CURRENT_USER_PROFILE_VERSION
+    fn assert_profile_version_supported(env: &Env, version: u32) {
+        if version > CURRENT_USER_PROFILE_VERSION {
+            env.panic_with_error(Error::UnsupportedProfileVersion);
+        }
     }
 
     fn bump_state_version(env: &Env, user: &Address) -> u32 {
@@ -2997,6 +3102,114 @@ impl OnboardingContract {
     /// `Error::UserNotFound`.
     pub fn get_user(env: Env, user: Address) -> UserProfile {
         Self::get_user_profile(&env, user)
+    }
+
+    /// Return the monotonic revision of a user's canonical onboarding state.
+    pub fn get_state_revision(env: Env, user: Address) -> u64 {
+        if Self::try_get_user_profile(&env, user.clone()).is_none() {
+            env.panic_with_error(Error::UserNotFound);
+        }
+        Self::state_revision(&env, &user)
+    }
+
+    /// Issue a state-bound proof for one configured escrow operation.
+    pub fn get_onboarding_attestation(
+        env: Env,
+        user: Address,
+        operation_id: Bytes,
+        contract_instance: Address,
+    ) -> OnboardingAttestation {
+        if operation_id.is_empty() {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        if config.escrow_contract != Some(contract_instance.clone()) {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let profile = Self::assert_user_onboarded_and_active(&env, user.clone());
+        let state_revision = Self::state_revision(&env, &user);
+        let ledger_sequence = env.ledger().sequence();
+        let state_digest = Self::attestation_digest(
+            &env,
+            &user,
+            profile.version,
+            profile.role,
+            profile.is_verified,
+            profile.status,
+            state_revision,
+            ledger_sequence,
+            &operation_id,
+            &contract_instance,
+        );
+        OnboardingAttestation {
+            account: user,
+            profile_version: profile.version,
+            role: profile.role,
+            is_verified: profile.is_verified,
+            status: profile.status,
+            state_revision,
+            ledger_sequence,
+            operation_id,
+            contract_instance,
+            state_digest,
+        }
+    }
+
+    /// Validate and consume a state proof. The escrow contract is the only
+    /// configured caller allowed to establish this authorization boundary.
+    pub fn validate_onboarding_attestation(env: Env, attestation: OnboardingAttestation) -> bool {
+        if attestation.operation_id.is_empty() {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        if config.escrow_contract != Some(attestation.contract_instance.clone()) {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        Self::require_ttl_bump_auth(&config);
+        let used_key = DataKey::UsedAttestation(
+            attestation.account.clone(),
+            attestation.operation_id.clone(),
+        );
+        if env.storage().persistent().has(&used_key) {
+            env.panic_with_error(Error::AttestationReplay);
+        }
+        let profile = Self::assert_user_onboarded_and_active(&env, attestation.account.clone());
+        let current_revision = Self::state_revision(&env, &attestation.account);
+        if attestation.ledger_sequence != env.ledger().sequence()
+            || attestation.state_revision != current_revision
+            || attestation.profile_version != profile.version
+            || attestation.role != profile.role
+            || attestation.is_verified != profile.is_verified
+            || attestation.status != profile.status
+        {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        let expected = Self::attestation_digest(
+            &env,
+            &attestation.account,
+            profile.version,
+            profile.role,
+            profile.is_verified,
+            profile.status,
+            current_revision,
+            attestation.ledger_sequence,
+            &attestation.operation_id,
+            &attestation.contract_instance,
+        );
+        if expected != attestation.state_digest {
+            env.panic_with_error(Error::InvalidAttestation);
+        }
+        env.storage().persistent().set(&used_key, &true);
+        Self::extend_persistent(&env, &used_key);
+        true
     }
 
     /// Migrate one user profile to the latest flat storage schema (admin only).
@@ -3916,10 +4129,25 @@ impl OnboardingContract {
 
         metrics.total_escrow_count = metrics
             .total_escrow_count
-            .saturating_add(escrow_count_delta);
+            .checked_add(escrow_count_delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::EscrowCountOverflow));
 
         // Normalize volume to 7 decimals (base decimal for auto-verification thresholds)
-        let normalized_delta = Self::normalize_token_amount(&env, volume_delta, &token_address);
+        let token_client = token::Client::new(&env, &token_address);
+        let token_decimals = token_client.decimals();
+        let base_decimals = 7u32;
+
+        let normalized_delta = if token_decimals < base_decimals {
+            let diff = base_decimals - token_decimals;
+            volume_delta
+                .checked_mul(10i128.pow(diff))
+                .unwrap_or_else(|| env.panic_with_error(Error::VolumeOverflow))
+        } else if token_decimals > base_decimals {
+            let diff = token_decimals - base_decimals;
+            volume_delta / 10i128.pow(diff)
+        } else {
+            volume_delta
+        };
 
         metrics.total_volume = metrics
             .total_volume
@@ -3990,7 +4218,9 @@ impl OnboardingContract {
         let current = stored.unwrap_or(0u32);
 
         let next = if delta > 0 {
-            current.saturating_add(delta as u32)
+            current
+                .checked_add(delta as u32)
+                .unwrap_or_else(|| env.panic_with_error(Error::ActiveContractOverflow))
         } else {
             let subtract = (-delta) as u32;
             if subtract > current {

@@ -78,6 +78,52 @@ fn test_initialize_reserves_admin_username() {
     assert!(client.is_username_taken(&String::from_str(&env, "Admin")));
 }
 
+#[test]
+fn test_onboarding_attestation_rejects_forgery_and_replay() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let escrow_contract = Address::generate(&env);
+    client.set_escrow_contract(&escrow_contract);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "attested"), &UserRole::Buyer);
+    let operation_id = Bytes::from_slice(&env, b"operation-1");
+
+    let attestation = client.get_onboarding_attestation(
+        &user,
+        &operation_id,
+        &escrow_contract,
+    );
+    assert!(client.validate_onboarding_attestation(&attestation));
+    assert!(client.try_validate_onboarding_attestation(&attestation).is_err());
+
+    let mut forged = attestation.clone();
+    forged.role = UserRole::Artisan;
+    assert!(client.try_validate_onboarding_attestation(&forged).is_err());
+}
+
+#[test]
+fn test_onboarding_attestation_becomes_stale_after_role_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let escrow_contract = Address::generate(&env);
+    client.set_escrow_contract(&escrow_contract);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "revision"), &UserRole::Buyer);
+    let operation_id = Bytes::from_slice(&env, b"operation-2");
+    let attestation = client.get_onboarding_attestation(
+        &user,
+        &operation_id,
+        &escrow_contract,
+    );
+
+    client.update_user_role(&user, &UserRole::Artisan);
+    assert!(client.try_validate_onboarding_attestation(&attestation).is_err());
+}
+
 // ===== Onboarding =====
 
 fn onboard_user_success(
@@ -3606,3 +3652,4 @@ fn test_normal_verified_profile_is_unaffected_by_review_state() {
         UserRole::Artisan
     );
 }
+
