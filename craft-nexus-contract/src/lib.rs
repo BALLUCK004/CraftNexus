@@ -41,8 +41,6 @@ mod pagination_boundary_test;
 mod prop_test;
 #[cfg(test)]
 mod safe_arithmetic_counters_test;
-#[cfg(test)]
-mod idempotency_test;
 
 // Onboarding is a separate logical contract; only one `#[contract]` may be linked per WASM
 // artifact. Keep it in this crate for host tests (`cargo test`) but omit from guest builds.
@@ -269,10 +267,6 @@ pub enum Error {
     CounterOverflow = 83,
     /// Counter subtraction underflowed below zero (#1028).
     CounterUnderflow = 84,
-    /// An idempotency key has already been used for a completed operation (#1025).
-    IdempotencyKeyInUse = 85,
-    /// An idempotency key was supplied with different caller, op type, or parameters (#1025).
-    IdempotencyMismatch = 86,
     /// Pagination limit is zero; caller must request at least one item (#1022).
     PaginationLimitZero = 82,
     /// Pagination cursor is invalid (past end of dataset or empty dataset) (#1022).
@@ -5079,14 +5073,14 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .set(&buyer_index_key, &(order_id as u64));
-        Self::extend_persistent(env, &buyer_index_key);
+        Self::extend_persistent(&env, &buyer_index_key);
         let new_buyer_count = buyer_count
             .checked_add(1)
             .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
             .set(&buyer_count_key, &new_buyer_count);
-        Self::extend_persistent(env, &buyer_count_key);
+        Self::extend_persistent(&env, &buyer_count_key);
 
         // Update seller's escrow list using indexed storage (scalable approach)
         let seller_count_key = DataKey::SellerEscrowCount(seller.clone());
@@ -5099,14 +5093,14 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .set(&seller_index_key, &(order_id as u64));
-        Self::extend_persistent(env, &seller_index_key);
+        Self::extend_persistent(&env, &seller_index_key);
         let new_seller_count = seller_count
             .checked_add(1)
             .unwrap_or_else(|| env.panic_with_error(Error::CounterOverflow));
         env.storage()
             .persistent()
             .set(&seller_count_key, &new_seller_count);
-        Self::extend_persistent(env, &seller_count_key);
+        Self::extend_persistent(&env, &seller_count_key);
 
         Self::safe_update_active_contracts(env, buyer.clone(), 1);
         Self::safe_update_active_contracts(env, seller.clone(), 1);
