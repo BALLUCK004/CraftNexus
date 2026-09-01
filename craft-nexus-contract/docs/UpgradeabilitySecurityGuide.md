@@ -166,7 +166,7 @@ stellar contract invoke \
   --paused true
 ```
 
-When `is_paused` is `true`, escrow creation, release, refund initiation, dispute initiation, staking, and recurring cycle releases return `Error::ContractPaused` (code 15). Read-only views remain available. Admin/arbitrator paths needed to *clear* emergency conflicts — dispute resolution, upgrade cancel, fund sweep, and admin recovery — stay reachable while paused. Emits the `platform_paused` event.
+The public read-only `is_paused()` query returns the current pause bit as a boolean. It reads the same `PlatformConfig::is_paused` value used by write guards, requires no authentication, and returns `false` before initialization. When `is_paused` is `true`, escrow creation, release, refund initiation, dispute initiation, staking, and recurring cycle releases return `Error::ContractPaused` (code 15). Read-only views remain available. Admin/arbitrator paths needed to *clear* emergency conflicts — dispute resolution, upgrade cancel, fund sweep, and admin recovery — stay reachable while paused. Emits the `platform_paused` event.
 
 To resume normal operations:
 
